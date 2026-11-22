@@ -9,6 +9,7 @@
 
 pub mod config;
 pub mod error;
+pub mod media;
 pub mod midi;
 pub mod model;
 pub mod render;
