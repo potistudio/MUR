@@ -1,0 +1,19 @@
+[package]
+name = "mur"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100.0"
+authors = ["potistudio <potistudio@proton.me>"]
+license = "MIT"
+publish = false
+
+[profile.dev]
+debug = false
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
