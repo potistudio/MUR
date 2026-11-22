@@ -1,0 +1,694 @@
+//! Command line arguments, project files, and persisted session state.
+//!
+//! Media paths from a project file are resolved relative to the project file's
+//! parent directory, while the persisted state stores clip *paths* rather than
+//! transient [`ClipId`] values so a restart restores exactly the same clips.
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::ConfigError;
+use crate::model::app_state::{AppState, OutputDisplaySelection};
+use crate::model::blend::BlendMode;
+use crate::model::clip::ClipId;
+use crate::model::effect::MasterEffects;
+use crate::model::layer::{LayerIndex, LayerState, PlaybackMode};
+
+/// Version stamped into saved state files.
+pub const STATE_VERSION: u32 = 1;
+
+/// Default quiet period before a dirty session is written to disk.
+pub const DEFAULT_AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(750);
+
+/// Command line arguments accepted by the `mur` binary.
+#[derive(Debug, Clone, clap::Parser)]
+#[command(name = "mur", version, about = "MUR - live performance VJ software")]
+pub struct CliArgs {
+	/// Folder scanned for clips at startup.
+	#[arg(long, value_name = "PATH")]
+	pub folder: Option<PathBuf>,
+	/// Project configuration file in TOML or JSON.
+	#[arg(long, value_name = "PATH")]
+	pub project: Option<PathBuf>,
+	/// Session state file to use instead of the discovered default.
+	#[arg(long, value_name = "PATH")]
+	pub state: Option<PathBuf>,
+	/// Start empty instead of restoring the previous session.
+	#[arg(long)]
+	pub no_restore: bool,
+}
+
+/// Well-known directories used by MUR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppPaths {
+	/// Directory holding user-editable configuration.
+	pub config_dir: PathBuf,
+	/// Directory holding generated state, logs, and caches.
+	pub data_dir: PathBuf,
+	/// Default location of the auto-saved session state.
+	pub state_file: PathBuf,
+	/// Directory for rolling log files.
+	pub log_dir: PathBuf,
+}
+
+impl AppPaths {
+	/// Discovers OS-specific directories.
+	///
+	/// Falls back to a temporary directory when the platform reports no home
+	/// directory, so startup never fails because of a missing profile.
+	pub fn discover() -> Self {
+		match directories::ProjectDirs::from("io", "potistudio", "MUR") {
+			Some(dirs) => Self::from_dirs(dirs.config_dir().to_path_buf(), dirs.data_dir().to_path_buf()),
+			None => {
+				let base = std::env::temp_dir().join("mur");
+				Self::from_dirs(base.clone(), base)
+			}
+		}
+	}
+
+	/// Builds the path set from explicit config and data directories.
+	pub fn from_dirs(config_dir: PathBuf, data_dir: PathBuf) -> Self {
+		let state_file = data_dir.join("state.json");
+		let log_dir = data_dir.join("logs");
+		Self {
+			config_dir,
+			data_dir,
+			state_file,
+			log_dir,
+		}
+	}
+
+	/// Returns `override_path` when the operator supplied one, else the default.
+	pub fn resolve_state_file(&self, override_path: Option<&Path>) -> PathBuf {
+		override_path.map_or_else(|| self.state_file.clone(), Path::to_path_buf)
+	}
+}
+
+/// Project configuration loaded from a TOML or JSON file.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectConfig {
+	/// Folder scanned for clips when [`ProjectConfig::clips`] is empty.
+	pub clip_folder: Option<PathBuf>,
+	/// Explicit clip files, in grid order.
+	pub clips: Vec<PathBuf>,
+	/// Requested output display; `None` keeps the current selection.
+	pub output: Option<OutputDisplaySelection>,
+	/// Master effect values applied on load.
+	pub effects: Option<MasterEffects>,
+	/// Initial layer settings, at most four entries are used.
+	pub layers: Vec<PersistedLayerState>,
+	/// MIDI input port to open on startup.
+	pub preferred_midi_port: Option<String>,
+}
+
+impl ProjectConfig {
+	/// Loads a project file, resolving relative media paths against its directory.
+	pub fn load(path: &Path) -> Result<Self, ConfigError> {
+		let contents = std::fs::read_to_string(path).map_err(|error| ConfigError::io(path, error))?;
+		let mut config = Self::parse(&contents, path)?;
+		let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+		config.resolve_paths(base_dir);
+		if let Some(effects) = config.effects.as_mut() {
+			effects.clamp_all();
+		}
+		Ok(config)
+	}
+
+	/// Parses project file contents according to the path's extension.
+	pub fn parse(contents: &str, path: &Path) -> Result<Self, ConfigError> {
+		let extension = path
+			.extension()
+			.and_then(|ext| ext.to_str())
+			.map(str::to_ascii_lowercase);
+		match extension.as_deref() {
+			Some("toml") => {
+				toml::from_str(contents).map_err(|error| ConfigError::parse(path, "TOML", error.to_string()))
+			}
+			Some("json") => {
+				serde_json::from_str(contents).map_err(|error| ConfigError::parse(path, "JSON", error.to_string()))
+			}
+			_ => Err(ConfigError::UnsupportedFormat {
+				path: path.display().to_string(),
+			}),
+		}
+	}
+
+	/// Rewrites every relative media path to be absolute against `base_dir`.
+	pub fn resolve_paths(&mut self, base_dir: &Path) {
+		if let Some(folder) = self.clip_folder.as_mut() {
+			*folder = resolve_relative(folder, base_dir);
+		}
+		self.clips = self.clips.iter().map(|clip| resolve_relative(clip, base_dir)).collect();
+		for layer in &mut self.layers {
+			layer.resolve_paths(base_dir);
+		}
+	}
+
+	/// Explicit clip files, or `None` when the loader should scan the folder.
+	pub fn explicit_clips(&self) -> Option<&[PathBuf]> {
+		if self.clips.is_empty() { None } else { Some(&self.clips) }
+	}
+}
+
+/// Restart-persistent settings of a single layer.
+///
+/// The active clip is identified by its file path because [`ClipId`] values are
+/// reassigned on every launch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersistedLayerState {
+	/// Path of the clip that was active on this layer.
+	pub clip_path: Option<PathBuf>,
+	/// Loop or one-shot behaviour.
+	pub playback_mode: PlaybackMode,
+	/// Playback speed in `-2.0..=4.0`.
+	pub speed: f32,
+	/// Layer opacity in `0.0..=1.0`.
+	pub opacity: f32,
+	/// Blend mode of the layer.
+	pub blend_mode: BlendMode,
+	/// Playhead position in frames; restored for convenience only.
+	pub playhead_frame: f64,
+}
+
+impl Default for PersistedLayerState {
+	fn default() -> Self {
+		Self {
+			clip_path: None,
+			playback_mode: PlaybackMode::Loop,
+			speed: 1.0,
+			opacity: 1.0,
+			blend_mode: BlendMode::Normal,
+			playhead_frame: 0.0,
+		}
+	}
+}
+
+impl PersistedLayerState {
+	/// Captures a live layer, storing the clip path instead of the runtime id.
+	pub fn capture(layer: &LayerState, clip_path: Option<PathBuf>) -> Self {
+		Self {
+			clip_path,
+			playback_mode: layer.playback_mode,
+			speed: layer.speed,
+			opacity: layer.opacity,
+			blend_mode: layer.blend_mode,
+			playhead_frame: layer.playhead_frame,
+		}
+	}
+
+	/// Rebuilds a layer, binding `clip` when the persisted path could be resolved.
+	///
+	/// Restored layers are stopped on their first frame: live output must never
+	/// start moving on its own after a crash recovery.
+	pub fn restore(&self, clip: Option<ClipId>) -> LayerState {
+		let mut layer = LayerState {
+			selected_clip: clip,
+			active_clip: clip,
+			playback_mode: self.playback_mode,
+			blend_mode: self.blend_mode,
+			..LayerState::default()
+		};
+		layer.set_speed(self.speed);
+		layer.set_opacity(self.opacity);
+		layer
+	}
+
+	/// Resolves the persisted clip path against `base_dir`.
+	pub fn resolve_paths(&mut self, base_dir: &Path) {
+		if let Some(path) = self.clip_path.as_mut() {
+			*path = resolve_relative(path, base_dir);
+		}
+	}
+}
+
+/// Auto-saved snapshot of the previous session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersistedState {
+	/// Schema version of this file.
+	pub version: u32,
+	/// Every clip that was loaded, in grid order.
+	pub clip_paths: Vec<PathBuf>,
+	/// Per-layer settings, always four entries.
+	pub layers: [PersistedLayerState; 4],
+	/// Master effect values.
+	pub effects: MasterEffects,
+	/// One-based number of the focused layer.
+	pub focused_layer: u8,
+	/// Requested output display.
+	pub output: OutputDisplaySelection,
+	/// MIDI port the operator selected.
+	pub selected_midi_port: Option<String>,
+}
+
+impl Default for PersistedState {
+	fn default() -> Self {
+		Self {
+			version: STATE_VERSION,
+			clip_paths: Vec::new(),
+			layers: std::array::from_fn(|_| PersistedLayerState::default()),
+			effects: MasterEffects::default(),
+			focused_layer: 1,
+			output: OutputDisplaySelection::default(),
+			selected_midi_port: None,
+		}
+	}
+}
+
+impl PersistedState {
+	/// Captures the restart-persistent parts of `app`.
+	pub fn capture(app: &AppState) -> Self {
+		let layers = std::array::from_fn(|index| {
+			app.layers
+				.get(index)
+				.map_or_else(PersistedLayerState::default, |layer| {
+					let clip_path = layer
+						.active_clip
+						.or(layer.selected_clip)
+						.and_then(|id| app.clip_by_id(id))
+						.map(|clip| clip.path.clone());
+					PersistedLayerState::capture(layer, clip_path)
+				})
+		});
+
+		Self {
+			version: STATE_VERSION,
+			clip_paths: app.clips.iter().map(|clip| clip.path.clone()).collect(),
+			layers,
+			effects: app.effects.clone(),
+			focused_layer: app.focused_layer.number(),
+			output: app.output.clone(),
+			selected_midi_port: app.selected_midi_port.clone(),
+		}
+	}
+
+	/// Applies persisted settings to `app`.
+	///
+	/// `resolve_clip` maps a persisted clip path onto the [`ClipId`] of the clip
+	/// that this session loaded from it; returning `None` leaves the layer empty.
+	pub fn restore_into<F>(&self, app: &mut AppState, mut resolve_clip: F)
+	where
+		F: FnMut(&Path) -> Option<ClipId>,
+	{
+		app.effects = self.effects.clone();
+		app.effects.clamp_all();
+		app.output = self.output.clone();
+		app.selected_midi_port = self.selected_midi_port.clone();
+		app.focused_layer = LayerIndex::from_number(self.focused_layer).unwrap_or_default();
+
+		for (index, persisted) in self.layers.iter().enumerate() {
+			let clip = persisted.clip_path.as_deref().and_then(&mut resolve_clip);
+			if let Some(layer) = app.layers.get_mut(index) {
+				*layer = persisted.restore(clip);
+			}
+		}
+
+		app.dirty = false;
+	}
+}
+
+/// Writes `state` to `path` through a sibling `.tmp` file and an atomic rename.
+pub fn save_state_atomic(path: &Path, state: &PersistedState) -> Result<(), ConfigError> {
+	let json = serde_json::to_string_pretty(state).map_err(|error| ConfigError::Serialize {
+		path: path.display().to_string(),
+		detail: error.to_string(),
+	})?;
+
+	if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+		std::fs::create_dir_all(parent).map_err(|error| ConfigError::io(parent, error))?;
+	}
+
+	let temp_path = sibling_temp_path(path);
+	let mut file = std::fs::File::create(&temp_path).map_err(|error| ConfigError::io(&temp_path, error))?;
+	file.write_all(json.as_bytes())
+		.map_err(|error| ConfigError::io(&temp_path, error))?;
+	file.sync_all().map_err(|error| ConfigError::io(&temp_path, error))?;
+	drop(file);
+
+	std::fs::rename(&temp_path, path).map_err(|error| {
+		let _ = std::fs::remove_file(&temp_path);
+		ConfigError::io(path, error)
+	})
+}
+
+/// Loads a persisted snapshot.
+///
+/// Returns `Ok(None)` when the file does not exist or was written by a newer MUR
+/// version, and an error when it exists but cannot be read or parsed.
+pub fn load_state(path: &Path) -> Result<Option<PersistedState>, ConfigError> {
+	let contents = match std::fs::read_to_string(path) {
+		Ok(contents) => contents,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+		Err(error) => return Err(ConfigError::io(path, error)),
+	};
+
+	let state: PersistedState =
+		serde_json::from_str(&contents).map_err(|error| ConfigError::parse(path, "JSON", error.to_string()))?;
+
+	if state.version > STATE_VERSION {
+		return Ok(None);
+	}
+	Ok(Some(state))
+}
+
+/// Debounced, non-blocking helper that decides when to auto-save.
+///
+/// The caller marks state dirty on every change and polls [`StateSaver::save_if_due`]
+/// from the render loop; disk writes happen at most once per debounce interval.
+#[derive(Debug, Clone)]
+pub struct StateSaver {
+	debounce: Duration,
+	last_save: Instant,
+	dirty: bool,
+}
+
+impl StateSaver {
+	/// Creates a saver that waits `debounce` after the last change before writing.
+	pub fn new(debounce: Duration) -> Self {
+		Self {
+			debounce,
+			last_save: Instant::now(),
+			dirty: false,
+		}
+	}
+
+	/// Creates a saver with [`DEFAULT_AUTOSAVE_DEBOUNCE`].
+	pub fn with_default_debounce() -> Self {
+		Self::new(DEFAULT_AUTOSAVE_DEBOUNCE)
+	}
+
+	/// Marks the session as changed and awaiting a save.
+	pub fn mark_dirty(&mut self) {
+		self.dirty = true;
+	}
+
+	/// Returns `true` when changes are waiting to be written.
+	pub fn is_dirty(&self) -> bool {
+		self.dirty
+	}
+
+	/// Instant of the last save attempt.
+	pub fn last_save(&self) -> Instant {
+		self.last_save
+	}
+
+	/// Returns `true` when a save is pending and the debounce interval elapsed.
+	pub fn is_due(&self, now: Instant) -> bool {
+		self.dirty && now.saturating_duration_since(self.last_save) >= self.debounce
+	}
+
+	/// Writes `state` when [`StateSaver::is_due`] holds.
+	///
+	/// Returns the save result when a write was attempted, or `None` when the
+	/// caller may skip work. Failures keep the dirty flag so the next poll retries.
+	pub fn save_if_due(
+		&mut self,
+		now: Instant,
+		path: &Path,
+		state: &PersistedState,
+	) -> Option<Result<(), ConfigError>> {
+		if !self.is_due(now) {
+			return None;
+		}
+
+		self.last_save = now;
+		let result = save_state_atomic(path, state);
+		if result.is_ok() {
+			self.dirty = false;
+		}
+		Some(result)
+	}
+}
+
+impl Default for StateSaver {
+	fn default() -> Self {
+		Self::with_default_debounce()
+	}
+}
+
+/// Joins `path` onto `base_dir` unless it is already absolute.
+fn resolve_relative(path: &Path, base_dir: &Path) -> PathBuf {
+	if path.is_absolute() {
+		path.to_path_buf()
+	} else {
+		base_dir.join(path)
+	}
+}
+
+/// Builds the `path.tmp` sibling used for atomic writes.
+fn sibling_temp_path(path: &Path) -> PathBuf {
+	let mut temp = path.as_os_str().to_os_string();
+	temp.push(".tmp");
+	PathBuf::from(temp)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+mod tests {
+	use super::*;
+	use clap::Parser as _;
+
+	use crate::model::clip::{ClipInfo, ClipKind, ClipStatus};
+	use crate::model::layer::PlaybackState;
+
+	/// Creates a unique, not-yet-existing path under the system temp directory.
+	fn temp_path(name: &str) -> PathBuf {
+		let unique = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|elapsed| elapsed.as_nanos())
+			.unwrap_or_default();
+		std::env::temp_dir().join(format!("mur-test-{}-{}-{}", std::process::id(), unique, name))
+	}
+
+	fn clip(id: u64, path: &str) -> ClipInfo {
+		ClipInfo {
+			id: ClipId(id),
+			path: PathBuf::from(path),
+			name: "clip.mov".to_string(),
+			kind: ClipKind::Hap,
+			width: 1920,
+			height: 1080,
+			fps: 60.0,
+			frame_count: 600,
+			has_alpha: false,
+			status: ClipStatus::Ready,
+			thumbnail: None,
+		}
+	}
+
+	#[test]
+	fn cli_parses_all_flags() {
+		let args = CliArgs::try_parse_from([
+			"mur",
+			"--folder",
+			"/media",
+			"--project",
+			"show.toml",
+			"--state",
+			"state.json",
+			"--no-restore",
+		])
+		.unwrap();
+		assert_eq!(args.folder, Some(PathBuf::from("/media")));
+		assert_eq!(args.project, Some(PathBuf::from("show.toml")));
+		assert_eq!(args.state, Some(PathBuf::from("state.json")));
+		assert!(args.no_restore);
+
+		let empty = CliArgs::try_parse_from(["mur"]).unwrap();
+		assert!(empty.folder.is_none());
+		assert!(!empty.no_restore);
+	}
+
+	#[test]
+	fn app_paths_compose_state_and_log_locations() {
+		let paths = AppPaths::from_dirs(PathBuf::from("/cfg"), PathBuf::from("/data"));
+		assert_eq!(paths.state_file, PathBuf::from("/data/state.json"));
+		assert_eq!(paths.log_dir, PathBuf::from("/data/logs"));
+		assert_eq!(paths.resolve_state_file(None), PathBuf::from("/data/state.json"));
+		assert_eq!(
+			paths.resolve_state_file(Some(Path::new("/custom.json"))),
+			PathBuf::from("/custom.json")
+		);
+	}
+
+	#[test]
+	fn app_paths_discovery_is_total() {
+		let paths = AppPaths::discover();
+		assert!(paths.state_file.starts_with(&paths.data_dir));
+		assert!(paths.log_dir.starts_with(&paths.data_dir));
+	}
+
+	#[test]
+	fn project_json_resolves_relative_paths() {
+		let json = r#"{
+			"clip_folder": "media",
+			"clips": ["intro.mov", "/absolute/loop.mov"],
+			"layers": [{"clip_path": "layers/a.mov"}],
+			"preferred_midi_port": "Launch Control XL 3"
+		}"#;
+		let mut config = ProjectConfig::parse(json, Path::new("/show/project.json")).unwrap();
+		config.resolve_paths(Path::new("/show"));
+
+		assert_eq!(config.clip_folder, Some(PathBuf::from("/show/media")));
+		assert_eq!(
+			config.explicit_clips().unwrap().to_vec(),
+			vec![PathBuf::from("/show/intro.mov"), PathBuf::from("/absolute/loop.mov")]
+		);
+		assert_eq!(config.layers[0].clip_path, Some(PathBuf::from("/show/layers/a.mov")));
+		assert_eq!(config.preferred_midi_port.as_deref(), Some("Launch Control XL 3"));
+	}
+
+	#[test]
+	fn project_toml_parses_partial_layer_settings() {
+		let toml = r#"
+			clips = ["a.mov"]
+			[[layers]]
+			clip_path = "layers/one.mov"
+			opacity = 0.5
+			[effects]
+			master_dimmer = 0.4
+		"#;
+		let config = ProjectConfig::parse(toml, Path::new("show.toml")).unwrap();
+		assert_eq!(config.layers.len(), 1);
+		assert_eq!(config.layers[0].opacity, 0.5);
+		assert_eq!(config.layers[0].blend_mode, BlendMode::Normal);
+		assert_eq!(config.layers[0].playback_mode, PlaybackMode::Loop);
+		assert_eq!(config.effects.unwrap().master_dimmer, 0.4);
+	}
+
+	#[test]
+	fn project_load_rejects_unknown_extension() {
+		let error = ProjectConfig::parse("{}", Path::new("show.yaml")).unwrap_err();
+		assert!(matches!(error, ConfigError::UnsupportedFormat { .. }));
+	}
+
+	#[test]
+	fn project_load_reads_from_disk_and_resolves_media() {
+		let dir = temp_path("project");
+		std::fs::create_dir_all(&dir).unwrap();
+		let file = dir.join("show.json");
+		std::fs::write(&file, r#"{"clips":["clips/a.mov"]}"#).unwrap();
+
+		let config = ProjectConfig::load(&file).unwrap();
+		assert_eq!(config.clips, [dir.join("clips/a.mov")]);
+		std::fs::remove_dir_all(&dir).ok();
+	}
+
+	#[test]
+	fn persisted_state_round_trips_through_atomic_save() {
+		let mut app = AppState::default();
+		app.upsert_clip(clip(1, "/media/intro.mov"));
+		app.trigger_clip_on_layer(LayerIndex::ALL[1], ClipId(1));
+		app.set_layer_opacity(LayerIndex::ALL[1], 0.35);
+		app.effects.master_dimmer = 0.6;
+		app.selected_midi_port = Some("Launch Control XL 3".to_string());
+		app.focused_layer = LayerIndex::ALL[2];
+
+		let expected = PersistedState::capture(&app);
+		assert_eq!(expected.version, STATE_VERSION);
+		assert_eq!(expected.layers[1].clip_path, Some(PathBuf::from("/media/intro.mov")));
+		assert_eq!(expected.focused_layer, 3);
+
+		let dir = temp_path("state");
+		let path = dir.join("state.json");
+		save_state_atomic(&path, &expected).unwrap();
+		assert!(!sibling_temp_path(&path).exists());
+
+		let loaded = load_state(&path).unwrap().unwrap();
+		assert_eq!(loaded, expected);
+		std::fs::remove_dir_all(&dir).ok();
+	}
+
+	#[test]
+	fn restoring_state_rebinds_clips_by_path() {
+		let mut app = AppState::default();
+		app.upsert_clip(clip(7, "/media/intro.mov"));
+		app.effects = MasterEffects {
+			master_dimmer: 0.2,
+			..MasterEffects::default()
+		};
+		app.focused_layer = LayerIndex::ALL[3];
+		app.layers[0].playback_mode = PlaybackMode::OneShot;
+
+		let mut state = PersistedState::capture(&app);
+		state.layers[0].clip_path = Some(PathBuf::from("/media/intro.mov"));
+		state.layers[1].clip_path = Some(PathBuf::from("/media/missing.mov"));
+
+		let mut restored = AppState {
+			effects: MasterEffects {
+				master_dimmer: 2.0,
+				..MasterEffects::default()
+			},
+			..AppState::default()
+		};
+		state.restore_into(&mut restored, |path| {
+			if path == Path::new("/media/intro.mov") {
+				Some(ClipId(7))
+			} else {
+				None
+			}
+		});
+
+		assert_eq!(restored.focused_layer, LayerIndex::ALL[3]);
+		assert_eq!(restored.effects.master_dimmer, 0.2);
+		assert_eq!(restored.layer(LayerIndex::ALL[0]).active_clip, Some(ClipId(7)));
+		assert_eq!(restored.layer(LayerIndex::ALL[0]).playback_mode, PlaybackMode::OneShot);
+		assert_eq!(
+			restored.layer(LayerIndex::ALL[0]).playback_state,
+			PlaybackState::Stopped
+		);
+		assert_eq!(restored.layer(LayerIndex::ALL[1]).active_clip, None);
+		assert!(!restored.dirty);
+	}
+
+	#[test]
+	fn load_state_returns_none_for_missing_file() {
+		let path = temp_path("missing").join("state.json");
+		assert!(load_state(&path).unwrap().is_none());
+	}
+
+	#[test]
+	fn load_state_rejects_malformed_and_future_files() {
+		let dir = temp_path("malformed");
+		std::fs::create_dir_all(&dir).unwrap();
+
+		let malformed = dir.join("bad.json");
+		std::fs::write(&malformed, "not json").unwrap();
+		assert!(matches!(load_state(&malformed).unwrap_err(), ConfigError::Parse { .. }));
+
+		let future = dir.join("future.json");
+		std::fs::write(&future, format!(r#"{{"version":{}}}"#, STATE_VERSION + 1)).unwrap();
+		assert!(load_state(&future).unwrap().is_none());
+
+		std::fs::remove_dir_all(&dir).ok();
+	}
+
+	#[test]
+	fn state_saver_debounces_until_dirty_and_elapsed() {
+		let dir = temp_path("saver");
+		let path = dir.join("state.json");
+		let mut saver = StateSaver::new(Duration::from_millis(100));
+		let state = PersistedState::default();
+
+		let now = Instant::now();
+		assert!(saver.save_if_due(now, &path, &state).is_none());
+		saver.mark_dirty();
+		assert!(saver.is_dirty());
+		assert!(!saver.is_due(now));
+
+		let due = now + Duration::from_millis(150);
+		let result = saver.save_if_due(due, &path, &state);
+		assert!(result.is_some());
+		assert!(result.unwrap().is_ok());
+		assert!(!saver.is_dirty());
+		assert_eq!(saver.last_save(), due);
+		assert!(path.exists());
+
+		std::fs::remove_dir_all(&dir).ok();
+	}
+}
