@@ -11,3 +11,4 @@ pub mod config;
 pub mod error;
 pub mod midi;
 pub mod model;
+pub mod render;
