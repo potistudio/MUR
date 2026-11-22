@@ -12,4 +12,5 @@ pub mod error;
 pub mod media;
 pub mod midi;
 pub mod model;
+pub mod platform;
 pub mod render;
