@@ -1243,7 +1243,7 @@ fn state_files_tolerate_one_three_and_five_layer_entries() {
 }
 
 // ---------------------------------------------------------------------------
-// SPEC §11 MIDI <-> UI parity
+// SPEC §6.3 MIDI <-> UI parity
 // ---------------------------------------------------------------------------
 
 /// One row of the MIDI -> UI parity table.
@@ -1294,7 +1294,7 @@ fn parity_state() -> AppState {
 	app
 }
 
-/// Every mapped MIDI control paired with its UI equivalent (SPEC §11).
+/// Every mapped MIDI control paired with its UI equivalent (SPEC §6.3).
 fn parity_cases() -> Vec<ParityCase> {
 	let first = LayerIndex::ALL[0];
 	let second = LayerIndex::ALL[1];
@@ -1440,15 +1440,25 @@ fn parity_cases() -> Vec<ParityCase> {
 #[test]
 fn midi_actions_and_ui_commands_mutate_identical_state() {
 	let cases = parity_cases();
-	assert_eq!(cases.len(), 22, "SPEC §11 maps 22 distinct MIDI controls");
+	assert_eq!(cases.len(), 22, "SPEC §6.3 maps 22 distinct MIDI controls");
 
 	for case in cases {
+		let initial = parity_state();
 		let mut midi_app = parity_state();
 		let mut ui_app = parity_state();
 
 		let midi_outcome = apply_midi_action(&mut midi_app, case.midi);
 		let ui_outcome = apply_ui_command(&mut ui_app, &case.ui);
 
+		assert!(
+			midi_app.layers != initial.layers
+				|| midi_app.focused_layer != initial.focused_layer
+				|| midi_app.effects != initial.effects
+				|| midi_app.dirty != initial.dirty
+				|| LayerIndex::ALL.into_iter().any(|t| midi_outcome.contains(t)),
+			"`{}`: parity case did not mutate any state",
+			case.name
+		);
 		assert_eq!(midi_app.layers, ui_app.layers, "`{}`: layer state diverged", case.name);
 		assert_eq!(
 			midi_app.focused_layer, ui_app.focused_layer,
