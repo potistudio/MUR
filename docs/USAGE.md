@@ -30,7 +30,7 @@ cargo run --release -- [OPTIONS]
 3. If `--folder` is supplied, supported media files in that directory are appended to the clip library.
 
 > [!IMPORTANT]
-> **Safe Crash/Restart Recovery**: Restored clips and layers always come back in the `STOPPED` state (with their restored opacity, blend mode, speed, playback mode, and playhead position ready). Live output never starts moving on its own after a restart until you trigger or unpause a layer. A clip that was only *selected* on a layer (never triggered) is restored as the selection only, so the layer stays empty and a stray pause key cannot start it.
+> **Safe Crash/Restart Recovery**: Layers that were on air (playing or paused) when the state was saved come back **`PAUSED`** on their saved playhead frame, so the previous show picture is back on the output immediately (SPEC §7.3) but nothing moves; layers that were stopped stay `STOPPED`. Opacity, blend mode, speed, playback mode, master effects (including `BLACKOUT` and `DIMMER`), and the playhead are restored too. Live output never starts moving on its own after a restart until you resume or trigger a layer. A clip that was only *selected* on a layer (never triggered) is restored as the selection only, so the layer stays empty and a stray pause key cannot start it.
 
 ---
 
@@ -76,7 +76,7 @@ Four side-by-side layer strips (`L1` through `L4`, composited bottom-to-top from
   - **Drag & drop** media files, folders, or `.toml`/`.json` project files anywhere onto the control window.
 - **Clip Tiles**:
   - Top-left badge identifies the clip type (`HAP`, `HAP A`, `HAP Q`, or `IMG`); the pixel/compression format (`DXT1`, `DXT5`, `YCoCg`, `RGBA`) appears in the hover tooltip and layer strip.
-  - Top-right cyan pill lists any layers currently bound to that clip (including paused or restored stopped layers) (e.g. `L1 L3`).
+  - Top-right cyan pill lists any layers currently bound to that clip (including paused, restored, or stopped layers) (e.g. `L1 L3`).
   - **Single-click** thumbnail: selects the clip as `Next ▸` on the currently focused layer.
   - **Double-click** thumbnail: fires the clip immediately on the currently focused layer.
   - **`1` `2` `3` `4` buttons**: fires the clip directly on Layer 1–4.
@@ -218,7 +218,7 @@ Every MIDI-controlled function can also be performed from the keyboard (matching
 > [!TIP]
 > On macOS laptops where `F1`–`F12` default to system brightness/media keys, press `fn + F1..F12` (or enable *"Use F1, F2, etc. keys as standard function keys"* in **System Settings → Keyboard → Keyboard Shortcuts → Function Keys**), or use `Ctrl + 1..0` (`Ctrl + Shift + 5..9` to decrease) and `` ` `` (backtick) for Blackout without needing `fn`.
 >
-> **Crash-Recovered Sessions**: Restored layers start in `Stopped` state with their `playhead_frame` preserved so live output starts dark; press `Space`, `Alt + 1-4`, MIDI Notes `44–47`, or the layer's `Play` button to resume from the preserved `playhead_frame`, or `Shift + R` (MIDI Note `49`) to retrigger all active layers together from their start frame.
+> **Crash-Recovered Sessions**: Layers that were on air come back `Paused` (visible, frozen) on their preserved `playhead_frame`; layers that were stopped stay `Stopped` and dark. Press `Space`, `Alt + 1-4`, MIDI Notes `44–47`, or the layer's `Play` button to resume from the preserved `playhead_frame`, or `Shift + R` (MIDI Note `49`) to retrigger all active layers together from their start frame.
 
 ---
 

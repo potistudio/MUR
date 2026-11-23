@@ -16,7 +16,7 @@ use crate::model::app_state::{AppState, OutputDisplaySelection};
 use crate::model::blend::BlendMode;
 use crate::model::clip::ClipId;
 use crate::model::effect::MasterEffects;
-use crate::model::layer::{LayerIndex, LayerState, PlaybackMode};
+use crate::model::layer::{LayerIndex, LayerState, PlaybackMode, PlaybackState};
 
 /// Version stamped into saved state files.
 pub const STATE_VERSION: u32 = 1;
@@ -188,6 +188,13 @@ pub struct PersistedLayerState {
 	pub blend_mode: BlendMode,
 	/// Playhead position in frames; restored for convenience only.
 	pub playhead_frame: f64,
+	/// Transport state at save time.
+	///
+	/// A layer that was on air (playing or paused) is restored
+	/// [`PlaybackState::Paused`]: its frame is visible again right away but does
+	/// not move until the operator resumes it. Files without this field restore
+	/// [`PlaybackState::Stopped`].
+	pub playback_state: PlaybackState,
 }
 
 impl Default for PersistedLayerState {
@@ -200,6 +207,7 @@ impl Default for PersistedLayerState {
 			opacity: 1.0,
 			blend_mode: BlendMode::Normal,
 			playhead_frame: 0.0,
+			playback_state: PlaybackState::Stopped,
 		}
 	}
 }
@@ -217,6 +225,19 @@ impl PersistedLayerState {
 			opacity: layer.opacity,
 			blend_mode: layer.blend_mode,
 			playhead_frame: layer.playhead_frame,
+			playback_state: layer.playback_state,
+		}
+	}
+
+	/// Transport state a restored layer starts in.
+	///
+	/// On-air layers (playing or paused at save time) come back paused so the
+	/// previous show state is visible immediately (SPEC §7.3) while nothing moves
+	/// on its own; stopped or empty layers stay stopped.
+	pub fn restored_playback_state(&self) -> PlaybackState {
+		match self.playback_state {
+			PlaybackState::Playing | PlaybackState::Paused => PlaybackState::Paused,
+			PlaybackState::Stopped => PlaybackState::Stopped,
 		}
 	}
 
@@ -228,9 +249,10 @@ impl PersistedLayerState {
 	/// never made active.
 	///
 	/// The persisted playhead is restored so the operator returns to the frame
-	/// they left, but the layer stays [`PlaybackState::Stopped`](crate::model::PlaybackState::Stopped): live output must
-	/// never start moving on its own after a crash recovery. Invalid playhead
-	/// values (negative or non-finite) fall back to frame `0`.
+	/// they left. A layer that was on air comes back [`PlaybackState::Paused`]
+	/// (visible, frozen) and any other layer [`PlaybackState::Stopped`]: live
+	/// output must never start moving on its own after a crash recovery. Invalid
+	/// playhead values (negative or non-finite) fall back to frame `0`.
 	pub fn restore(&self, clip: Option<ClipId>, selected: Option<ClipId>) -> LayerState {
 		let mut layer = LayerState {
 			selected_clip: selected.or(clip),
@@ -246,6 +268,9 @@ impl PersistedLayerState {
 		} else {
 			0.0
 		};
+		if clip.is_some() {
+			layer.playback_state = self.restored_playback_state();
+		}
 		layer
 	}
 
@@ -761,7 +786,8 @@ mod tests {
 		assert_eq!(restored.layer(LayerIndex::ALL[0]).playback_mode, PlaybackMode::OneShot);
 		assert_eq!(
 			restored.layer(LayerIndex::ALL[0]).playback_state,
-			PlaybackState::Stopped
+			PlaybackState::Stopped,
+			"a layer that was stopped stays stopped"
 		);
 		assert_eq!(restored.layer(LayerIndex::ALL[1]).active_clip, None);
 		assert!(!restored.dirty);
@@ -891,6 +917,22 @@ mod tests {
 		let restored = state.layers[0].restore(Some(ClipId(1)), None);
 		assert_eq!(restored.playhead_frame, 37.5);
 		assert_eq!(restored.playback_state, PlaybackState::Stopped);
+
+		// On-air layers come back paused (visible, frozen); empty layers stay stopped.
+		for saved in [PlaybackState::Playing, PlaybackState::Paused] {
+			state.layers[0].playback_state = saved;
+			assert_eq!(
+				state.layers[0].restore(Some(ClipId(1)), None).playback_state,
+				PlaybackState::Paused,
+				"{saved:?}"
+			);
+			assert_eq!(
+				state.layers[0].restore(None, None).playback_state,
+				PlaybackState::Stopped,
+				"an unresolved clip leaves the layer stopped"
+			);
+		}
+		state.layers[0].playback_state = PlaybackState::Stopped;
 
 		for bad in [-1.0, f64::NAN, f64::INFINITY] {
 			state.layers[0].playhead_frame = bad;

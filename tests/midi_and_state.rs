@@ -1111,11 +1111,11 @@ fn persisted_state_round_trips_atomically_and_restores_stopped_layers() {
 		let persisted = &snapshot.layers[index];
 		assert_eq!(
 			layer.playback_state,
-			PlaybackState::Stopped,
-			"restored layers must never start moving on their own (SPEC §6.2/§8)"
+			PlaybackState::Paused,
+			"on-air layers come back visible but never start moving on their own (SPEC §7.3/§8)"
 		);
 		// The playhead itself is preserved: the operator returns to the frame they
-		// left, only the transport stays stopped until they press play.
+		// left, only the transport stays paused until they resume it.
 		approx_f64(layer.playhead_frame, persisted.playhead_frame);
 		assert_eq!(layer.playback_mode, persisted.playback_mode);
 		assert_eq!(layer.blend_mode, persisted.blend_mode);

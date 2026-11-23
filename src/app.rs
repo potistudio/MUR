@@ -143,6 +143,11 @@ pub struct PendingBinding {
 	/// Set when restoring a persisted session, whose selection is restored separately
 	/// and may differ from the active clip.
 	pub keep_selection: bool,
+	/// Show the bound clip paused (visible, frozen) instead of stopped.
+	///
+	/// Set when restoring a layer that was on air, so the previous show state is
+	/// visible again as soon as the clip loaded (SPEC §7.3).
+	pub show_paused: bool,
 }
 
 /// What [`ClipLibrary::complete`] changed.
@@ -263,7 +268,8 @@ impl ClipLibrary {
 	///
 	/// On success the clip slot becomes `Ready`, every layer already showing the clip gets
 	/// its `frame_count` and `clip_fps`, and pending bindings for `path` are bound (layers
-	/// stay `Stopped`, as restored layers never start playing on their own). On failure
+	/// stay `Stopped`, or `Paused` when restored from an on-air layer, as restored layers
+	/// never start playing on their own). On failure
 	/// the slot shows the error and every layer waiting for it records the error, while
 	/// other clips and layers are untouched (SPEC §9.1).
 	pub fn complete(
@@ -313,11 +319,13 @@ impl ClipLibrary {
 				for binding in ready {
 					let selection = state.layer(binding.layer).selected_clip;
 					if bind_layer_to_clip(state, binding.layer, clip_id, binding.playhead_frame) {
-						if binding.keep_selection
-							&& selection.is_some()
-							&& let Some(layer) = state.layer_mut(binding.layer)
-						{
-							layer.selected_clip = selection;
+						if let Some(layer) = state.layer_mut(binding.layer) {
+							if binding.keep_selection && selection.is_some() {
+								layer.selected_clip = selection;
+							}
+							if binding.show_paused {
+								layer.playback_state = PlaybackState::Paused;
+							}
 						}
 						set_flag(&mut outcome.bound_layers, binding.layer.index());
 					}
@@ -489,6 +497,7 @@ pub fn apply_persisted_state(
 				path: path.to_path_buf(),
 				playhead_frame: layer_state.playhead_frame,
 				keep_selection: true,
+				show_paused: layer_state.restored_playback_state() == PlaybackState::Paused,
 			});
 		}
 		// The selection does not need the clip to be loaded: its slot id is known as
@@ -591,6 +600,7 @@ pub fn apply_project(
 				path: path.to_path_buf(),
 				playhead_frame: settings.playhead_frame,
 				keep_selection: false,
+				show_paused: false,
 			}),
 		}
 	}
@@ -608,6 +618,9 @@ pub fn capture_persisted(state: &AppState, library: &ClipLibrary) -> PersistedSt
 		{
 			persisted.clip_path = Some(binding.path.clone());
 			persisted.playhead_frame = binding.playhead_frame;
+			if binding.show_paused {
+				persisted.playback_state = PlaybackState::Paused;
+			}
 		}
 	}
 	snapshot
@@ -2729,6 +2742,7 @@ mod tests {
 			opacity: 0.4,
 			blend_mode: BlendMode::Screen,
 			playhead_frame: 42.0,
+			playback_state: PlaybackState::Playing,
 		};
 		persisted.effects.master_dimmer = 0.5;
 
@@ -2743,6 +2757,11 @@ mod tests {
 
 		let snapshot = capture_persisted(&state, &library);
 		assert_eq!(snapshot.layers[1].clip_path, Some(PathBuf::from("/media/a.mov")));
+		assert_eq!(
+			snapshot.layers[1].playback_state,
+			PlaybackState::Paused,
+			"saving while the clip loads keeps the on-air layer visible"
+		);
 
 		let request = &requests[0];
 		let outcome = library.complete(
@@ -2760,7 +2779,11 @@ mod tests {
 		assert_eq!(layer.frame_count, 120);
 		assert_eq!(layer.clip_fps, 30.0);
 		assert_eq!(layer.playhead_frame, 42.0);
-		assert_eq!(layer.playback_state, PlaybackState::Stopped);
+		assert_eq!(
+			layer.playback_state,
+			PlaybackState::Paused,
+			"an on-air layer comes back visible but frozen"
+		);
 		assert_eq!(layer.playback_mode, PlaybackMode::OneShot);
 		assert_eq!(layer.blend_mode, BlendMode::Screen);
 		assert!(library.pending_bindings().is_empty());
@@ -2807,6 +2830,7 @@ mod tests {
 			path: PathBuf::from("/media/bad.mov"),
 			playhead_frame: 0.0,
 			keep_selection: false,
+			show_paused: false,
 		});
 		state.trigger_clip_on_layer(LayerIndex::ALL[3], bad.clip_id);
 
@@ -2841,6 +2865,7 @@ mod tests {
 			path: PathBuf::from("/media/c.mov"),
 			playhead_frame: 0.0,
 			keep_selection: false,
+			show_paused: false,
 		});
 		let outcome = apply_session_command(&mut state, &mut library, &UiCommand::RemoveClip(request.clip_id));
 		assert_eq!(outcome.remove_clip, Some(request.clip_id));
@@ -2874,6 +2899,7 @@ mod tests {
 			path: path.to_path_buf(),
 			playhead_frame: 0.0,
 			keep_selection: false,
+			show_paused: false,
 		});
 
 		// The stale result of the first load arrives first.
@@ -2904,6 +2930,7 @@ mod tests {
 			path: PathBuf::from("/media/restored.mov"),
 			playhead_frame: 3.0,
 			keep_selection: false,
+			show_paused: false,
 		});
 		state.trigger_clip_on_layer(LayerIndex::ALL[0], other.clip_id);
 
@@ -3023,6 +3050,7 @@ mod tests {
 			path: PathBuf::from("/media/x.mov"),
 			playhead_frame: 0.0,
 			keep_selection: false,
+			show_paused: false,
 		});
 		let outcome = apply_session_command(&mut state, &mut library, &UiCommand::ClearLayer(LayerIndex::ALL[1]));
 		assert!(outcome.was_cleared(LayerIndex::ALL[1]));
