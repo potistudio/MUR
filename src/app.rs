@@ -683,6 +683,21 @@ pub fn request_exit(state: &mut AppState) -> UiApplyOutcome {
 	apply_ui_command(state, &UiCommand::RequestExit)
 }
 
+/// Routes one native quit request (`Cmd+Q`, the app menu "Quit", Dock "Quit").
+///
+/// The first request opens the exit guard; a request arriving while the guard is already
+/// open confirms it, so pressing `Cmd+Q` twice quits like a native macOS app. Callers must
+/// only invoke this after consuming the native flag with [`platform::poll_quit_requested`],
+/// so a single press is never routed twice.
+pub fn handle_native_quit_request(state: &mut AppState) -> UiApplyOutcome {
+	let cmd = if state.exit_confirm_open {
+		UiCommand::ConfirmExit
+	} else {
+		UiCommand::RequestExit
+	};
+	apply_ui_command(state, &cmd)
+}
+
 /// Returns `true` for commands that may repeat while a key is held.
 ///
 /// Only continuous `Adjust*` commands repeat; triggers, toggles, clip stepping, layer focus
@@ -1835,7 +1850,7 @@ impl App {
 
 		// 1. Native quit requests.
 		if platform::poll_quit_requested() {
-			let outcome = request_exit(&mut self.state);
+			let outcome = handle_native_quit_request(&mut self.state);
 			self.apply_outcome(event_loop, &outcome);
 		}
 
@@ -1968,15 +1983,22 @@ impl App {
 		}
 	}
 
-	/// Syncs layers, renders the master frame, presents the output, then the control UI.
-	///
-	/// Returns the commands issued through the control UI this frame.
 	/// Runs [`App::render_frame`] with panic containment.
 	///
 	/// wgpu and egui-wgpu panic on some device-loss and validation paths. A panic inside
 	/// the frame marks the GPU as lost instead of unwinding out of the event loop, so the
-	/// regular recovery rebuilds the device (and the egui context) on the next tick.
+	/// regular recovery rebuilds the device (and the egui context) after
+	/// [`GPU_RETRY_INTERVAL`], so a persistent panic backs off instead of spinning.
 	fn render_frame_guarded(&mut self) -> Vec<UiCommand> {
+		// A stack already marked lost is waiting out the retry back-off; rendering with it
+		// again would re-panic every tick and keep pushing the retry out indefinitely.
+		if self
+			.runtime
+			.as_ref()
+			.is_some_and(|rt| rt.gpu.is_some() && rt.gpu_lost.is_some())
+		{
+			return Vec::new();
+		}
 		match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.render_frame())) {
 			Ok(commands) => commands,
 			Err(payload) => {
@@ -1984,6 +2006,7 @@ impl App {
 				tracing::error!(target: "render", "panic while rendering a frame: {detail}");
 				if let Some(rt) = self.runtime.as_mut() {
 					rt.gpu_lost = Some(format!("GPU frame panicked: {detail}"));
+					rt.gpu_retry_at = Some(Instant::now() + GPU_RETRY_INTERVAL);
 				}
 				Vec::new()
 			}
@@ -2006,6 +2029,9 @@ impl App {
 		}
 	}
 
+	/// Syncs layers, renders the master frame, presents the output, then the control UI.
+	///
+	/// Returns the commands issued through the control UI this frame.
 	fn render_frame(&mut self) -> Vec<UiCommand> {
 		let Some(rt) = self.runtime.as_mut() else {
 			return Vec::new();
@@ -2304,10 +2330,12 @@ impl ApplicationHandler<AppEvent> for App {
 	fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
 		match event {
 			AppEvent::QuitRequested => {
-				// Clear the native flag too, so the next tick does not route it twice.
-				let _ = platform::poll_quit_requested();
-				let outcome = request_exit(&mut self.state);
-				self.apply_outcome(event_loop, &outcome);
+				// Only the caller that consumes the native flag routes the request, so the
+				// wake-up event and the next tick never handle one press twice.
+				if platform::poll_quit_requested() {
+					let outcome = handle_native_quit_request(&mut self.state);
+					self.apply_outcome(event_loop, &outcome);
+				}
 			}
 			AppEvent::ClipLoaded { clip_id, path, result } => self.on_clip_loaded(clip_id, &path, result),
 			AppEvent::FilesPicked(paths) => self.ingest_paths(event_loop, &paths),
@@ -2833,6 +2861,19 @@ mod tests {
 		let confirmed = library_cmd(&mut state, UiCommand::ConfirmExit);
 		assert!(!state.exit_confirm_open);
 		assert_eq!(ExitAction::from_outcome(&confirmed), ExitAction::Quit);
+	}
+
+	#[test]
+	fn native_quit_request_opens_guard_then_confirms() {
+		let mut state = AppState::default();
+
+		let first = handle_native_quit_request(&mut state);
+		assert!(state.exit_confirm_open);
+		assert_eq!(ExitAction::from_outcome(&first), ExitAction::ShowGuard);
+
+		let second = handle_native_quit_request(&mut state);
+		assert!(!state.exit_confirm_open);
+		assert_eq!(ExitAction::from_outcome(&second), ExitAction::Quit);
 	}
 
 	#[test]

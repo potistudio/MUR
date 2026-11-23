@@ -49,8 +49,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Imp, NSObject, ProtocolObject, Sel};
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, ffi, msg_send, sel};
 use objc2_app_kit::{
-	NSApplication, NSApplicationTerminateReply, NSMainMenuWindowLevel, NSMenu, NSNormalWindowLevel, NSScreen, NSView,
-	NSWindow, NSWindowCollectionBehavior,
+	NSApplication, NSApplicationTerminateReply, NSEventType, NSMainMenuWindowLevel, NSMenu, NSNormalWindowLevel,
+	NSScreen, NSView, NSWindow, NSWindowCollectionBehavior,
 };
 use objc2_foundation::{
 	NSActivityOptions, NSNumber, NSObjectProtocol, NSProcessInfo, NSRect, NSString, NSUInteger, ns_string,
@@ -257,11 +257,17 @@ impl std::fmt::Debug for AppNapActivity {
 }
 
 impl AppNapActivity {
-	/// Begins a `UserInitiated | LatencyCritical` activity explaining live playback.
+	/// Begins a `UserInitiated | LatencyCritical | IdleDisplaySleepDisabled` activity
+	/// explaining live playback.
+	///
+	/// `IdleDisplaySleepDisabled` keeps the displays awake even when the operator drives
+	/// a set purely over MIDI, which macOS does not count as user activity.
 	pub fn begin() -> Self {
 		let reason = NSString::from_str("MUR live video output must render at a steady 60 fps");
 		let activity = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
-			NSActivityOptions::UserInitiated | NSActivityOptions::LatencyCritical,
+			NSActivityOptions::UserInitiated
+				| NSActivityOptions::LatencyCritical
+				| NSActivityOptions::IdleDisplaySleepDisabled,
 			&reason,
 		);
 		Self { activity }
@@ -293,6 +299,16 @@ define_class!(
 		// SAFETY: Standard action signature `- (void)murRequestQuit:(id)sender`.
 		#[unsafe(method(murRequestQuit:))]
 		fn mur_request_quit(&self, _sender: Option<&AnyObject>) {
+			// A held `Cmd+Q` auto-repeats the menu key equivalent; only the initial press
+			// may count, or one long press would open the exit guard and confirm it.
+			if let Some(mtm) = MainThreadMarker::new()
+				&& let Some(event) = NSApplication::sharedApplication(mtm).currentEvent()
+				// `isARepeat` raises for non-key events, so check the type first.
+				&& matches!(event.r#type(), NSEventType::KeyDown | NSEventType::KeyUp)
+				&& event.isARepeat()
+			{
+				return;
+			}
 			super::request_quit();
 		}
 	}

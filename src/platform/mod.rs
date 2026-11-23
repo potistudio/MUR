@@ -335,7 +335,9 @@ pub fn find_matching_monitor<'a, T: SummarizedMonitor>(monitors: &'a [T], select
 ///
 /// 1. exact id — an intentional choice, honored even for the excluded monitor;
 /// 2. the same native display id (see [`monitor_id_with_native`]) with a matching name,
-///    i.e. the very same physical display after a resolution change or rearrangement;
+///    ignoring a duplicate-model index such as `" (1)"` that macOS adds or drops when an
+///    identical display connects or disconnects, i.e. the very same physical display
+///    after a resolution change, rearrangement, or renumbering;
 /// 3. exact name, then case-insensitive name;
 /// 4. for a stale id, its name part, preferring the monitor at the same desktop position.
 ///
@@ -358,7 +360,7 @@ pub fn find_matching_monitor_excluding<'a, T: SummarizedMonitor>(
 		&& let Some(native) = parsed.native
 		&& let Some(found) = monitors.iter().find(|monitor| {
 			let summary = monitor.summary();
-			names_match(&summary.name, parsed.name)
+			names_match_ignoring_duplicate_index(&summary.name, parsed.name)
 				&& parse_monitor_id(&summary.id).is_some_and(|candidate| candidate.native == Some(native))
 		}) {
 		return Some(found);
@@ -397,6 +399,30 @@ fn find_by_name<'a, T: SummarizedMonitor>(monitors: &[&'a T], name: &str) -> Opt
 /// Case-insensitive, whitespace-trimmed name comparison.
 fn names_match(left: &str, right: &str) -> bool {
 	left.trim().to_lowercase() == right.trim().to_lowercase()
+}
+
+/// Trims `name` and strips a trailing duplicate-model index such as `" (2)"`.
+///
+/// Only an all-ASCII-digit parenthetical after a non-empty base is stripped, so names
+/// like `"Projector (HDMI)"` or `"(1)"` are kept as they are (apart from trimming).
+fn strip_duplicate_suffix(name: &str) -> &str {
+	let name = name.trim();
+	let Some(inner) = name.strip_suffix(')') else {
+		return name;
+	};
+	let Some((base, digits)) = inner.rsplit_once(" (") else {
+		return name;
+	};
+	let base = base.trim();
+	if base.is_empty() || digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+		return name;
+	}
+	base
+}
+
+/// Case-insensitive name comparison that ignores a duplicate-model index suffix.
+fn names_match_ignoring_duplicate_index(left: &str, right: &str) -> bool {
+	strip_duplicate_suffix(left).to_lowercase() == strip_duplicate_suffix(right).to_lowercase()
 }
 
 /// Components of a [`monitor_id`] / [`monitor_id_with_native`] string.
@@ -784,6 +810,30 @@ mod tests {
 		assert_eq!(plain.native, None);
 		assert_eq!(plain.position, "-1920,0");
 		assert!(parse_monitor_id("DELL").is_none());
+	}
+
+	#[test]
+	fn native_id_survives_duplicate_model_suffix_change() {
+		let selected = "DELL U2720Q (1)|1920x1080|1920,0|cg:7";
+
+		let renamed = vec![summary("DELL U2720Q|1920x1080|1920,0|cg:7", "DELL U2720Q", false)];
+		let found = find_matching_monitor(&renamed, Some(selected)).unwrap();
+		assert_eq!(found.id, "DELL U2720Q|1920x1080|1920,0|cg:7");
+
+		let other_dell = vec![summary(
+			"DELL U2720Q (2)|1920x1080|3840,0|cg:8",
+			"DELL U2720Q (2)",
+			false,
+		)];
+		assert!(find_matching_monitor(&other_dell, Some(selected)).is_none());
+
+		let other_model = vec![summary("Other Monitor|1920x1080|1920,0|cg:7", "Other Monitor", false)];
+		assert!(find_matching_monitor(&other_model, Some(selected)).is_none());
+
+		assert_eq!(strip_duplicate_suffix("  DELL U2720Q (12) "), "DELL U2720Q");
+		assert_eq!(strip_duplicate_suffix("Projector (HDMI)"), "Projector (HDMI)");
+		assert_eq!(strip_duplicate_suffix("(1)"), "(1)");
+		assert!(!names_match_ignoring_duplicate_index("Projector (HDMI)", "Projector"));
 	}
 
 	#[test]
