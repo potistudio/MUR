@@ -421,6 +421,62 @@ fn hapq_gpu_ycocg_matches_cpu_decode_and_cpu_fallback_path() {
 	);
 }
 
+/// HAP Q blocks whose 5-bit scale (blue) expands to a value that is not a
+/// multiple of 8 must decode identically on the GPU and on the CPU fallback.
+#[test]
+fn hapq_non_zero_scale_matches_between_gpu_and_cpu() {
+	let _guard = gpu_lock();
+	let Some(ctx) = gpu_context("hapq_scale") else {
+		return;
+	};
+	if !ctx.supports_bc {
+		eprintln!("BC textures unavailable; skipping GPU/CPU HAP Q scale comparison");
+		return;
+	}
+	let mut renderer = MasterRenderer::new(&ctx).unwrap();
+	// (Co, Cg, scale byte, Y): scale bytes expand from 5-bit 5, 7, 19, and 31.
+	for (index, raw) in [
+		[128_u8 + 70, 128 - 40, 41, 150],
+		[128 + 65, 128 - 65, 57, 120],
+		[128 - 90, 128 + 30, 156, 90],
+		[128 + 100, 128 + 100, 255, 60],
+	]
+	.into_iter()
+	.enumerate()
+	{
+		let block = bc3_solid_block(raw);
+		let mut data = Vec::new();
+		for _ in 0..4 {
+			data.extend_from_slice(&block);
+		}
+		let frame = DecodedFrame {
+			frame_index: index as u32,
+			width: 8,
+			height: 8,
+			payload: PixelPayload::Bc3YCoCg(data),
+		};
+		let cpu_pixels = decode_frame_to_rgba8(&frame).unwrap();
+		let cpu_center = pixel_at(&cpu_pixels, 8, 4, 4);
+		let layers = single_layer_inputs(&frame, ClipId(100 + index as u64));
+		renderer
+			.render_master(&ctx, &layers, &MasterEffects::default(), 0.0)
+			.unwrap();
+		let pixels = renderer.readback_master_rgba8(&ctx).unwrap();
+		let gpu_center = master_pixel(&pixels, INTERNAL_WIDTH / 2, INTERNAL_HEIGHT / 2);
+		eprintln!("HAP Q scale {raw:?}: GPU {gpu_center:?} CPU {cpu_center:?}");
+		assert_color(
+			gpu_center,
+			[
+				f32::from(cpu_center[0]) / 255.0,
+				f32::from(cpu_center[1]) / 255.0,
+				f32::from(cpu_center[2]) / 255.0,
+			],
+			2.0,
+			&format!("HAP Q scale {raw:?}"),
+		);
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Aspect-ratio margins
 // ---------------------------------------------------------------------------

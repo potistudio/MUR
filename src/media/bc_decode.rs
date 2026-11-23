@@ -133,9 +133,14 @@ fn decode_bc3_block(bytes: &[u8]) -> Block {
 }
 
 /// Converts one scaled-YCoCg pixel (`r=Co`, `g=Cg`, `b=scale`, `a=Y`) to RGBA.
+///
+/// The scale uses the same continuous formula as the GPU shader and the HAP
+/// reference `hapqconversion.frag` (`scale = b * 255 / 8 + 1` on normalized
+/// `b`, i.e. `b / 8 + 1` on the byte), so the CPU fallback and thumbnails
+/// match the GPU path exactly for every expanded 5-bit blue value.
 pub fn ycocg_to_rgba(pixel: [u8; 4]) -> [u8; 4] {
 	let [co_raw, cg_raw, scale_raw, y_raw] = pixel;
-	let scale = f32::from((scale_raw >> 3) + 1);
+	let scale = f32::from(scale_raw) / 8.0 + 1.0;
 	let co = (f32::from(co_raw) - 128.0) / scale;
 	let cg = (f32::from(cg_raw) - 128.0) / scale;
 	let y = f32::from(y_raw);
@@ -225,7 +230,7 @@ pub fn decode_bc3_to_rgba8(data: &[u8], width: u32, height: u32) -> Result<Vec<u
 
 /// Decodes HAP Q scaled-YCoCg BC3 blocks to opaque RGBA8.
 ///
-/// Per pixel: `scale = (b >> 3) + 1`, `co = (r - 128) / scale`,
+/// Per pixel: `scale = b / 8 + 1`, `co = (r - 128) / scale`,
 /// `cg = (g - 128) / scale`, `y = a`, then `R = y + co - cg`, `G = y + cg`,
 /// `B = y - co - cg`, `A = 255`.
 pub fn decode_bc3_ycocg_to_rgba8(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, MediaError> {
@@ -410,11 +415,42 @@ mod tests {
 		let rgba = decode_bc3_ycocg_to_rgba8(&block, 4, 4).unwrap();
 		assert_eq!(pixel(&rgba, 4, 0, 0), [102, 102, 94, 255]);
 
-		// Scale byte 255 → 5-bit 31 → (255 >> 3) + 1 = 32.
-		assert_eq!(ycocg_to_rgba([128 + 64, 128, 255, 100]), [102, 100, 98, 255]);
+		// Scale byte 255 → 255 / 8 + 1 = 32.875 (continuous, like the GPU shader).
+		assert_eq!(ycocg_to_rgba([128 + 66, 128, 255, 100]), [102, 100, 98, 255]);
 		// Clamping.
 		assert_eq!(ycocg_to_rgba([255, 0, 0, 255]), [255, 127, 255, 255]);
 		assert_eq!(ycocg_to_rgba([0, 0, 0, 0]), [0, 0, 255, 255]);
+	}
+
+	#[test]
+	fn ycocg_scale_matches_gpu_formula_for_non_multiple_of_eight_blue() {
+		// 5-bit blue 7 expands to 57, which is not a multiple of 8: the GPU uses
+		// 57 / 8 + 1 = 8.125, whereas `(57 >> 3) + 1` would truncate to 8.
+		let block = bc3_solid_block([128 + 65, 128 - 65, 57, 120]);
+		let scale_byte = {
+			let rgba = decode_bc3_to_rgba8(&block, 4, 4).unwrap();
+			pixel(&rgba, 4, 0, 0)
+		};
+		assert_eq!(scale_byte[2], 57);
+		let rgba = decode_bc3_ycocg_to_rgba8(&block, 4, 4).unwrap();
+		let out = pixel(&rgba, 4, 0, 0);
+		let [co_raw, cg_raw, scale_raw, y_raw] = scale_byte.map(f32::from);
+		let scale = scale_raw / 8.0 + 1.0;
+		let (co, cg) = ((co_raw - 128.0) / scale, (cg_raw - 128.0) / scale);
+		let expected = [y_raw + co - cg, y_raw + cg, y_raw - co - cg].map(|v| v.round().clamp(0.0, 255.0) as u8);
+		assert_eq!(&out[..3], &expected[..]);
+		assert_eq!(out[3], 255);
+
+		// Every expanded 5-bit blue value uses the continuous scale.
+		for b5 in 0u8..32 {
+			let byte = (b5 << 3) | (b5 >> 2);
+			let scale = f32::from(byte) / 8.0 + 1.0;
+			let co = (f32::from(200u8) - 128.0) / scale;
+			let expected_r = (100.0 + co - (f32::from(128u8) - 128.0) / scale)
+				.round()
+				.clamp(0.0, 255.0) as u8;
+			assert_eq!(ycocg_to_rgba([200, 128, byte, 100])[0], expected_r, "b5={b5}");
+		}
 	}
 
 	#[test]
