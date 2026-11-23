@@ -70,6 +70,8 @@ pub const OUTPUT_WINDOW_TITLE: &str = "MUR — Output";
 const MAX_MIDI_EVENTS_PER_TICK: usize = 512;
 /// Smoothing factor of the FPS / frame-time moving averages.
 const PERF_EMA_ALPHA: f32 = 0.1;
+/// Interval of the real-time performance summary written to the log.
+pub const PERF_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 /// Shader time wraps after this many seconds to keep `f32` precision.
 const SHADER_TIME_WRAP_SECS: f64 = 3600.0;
 /// Minimum spacing between two ticks triggered by `RedrawRequested`.
@@ -442,6 +444,128 @@ fn set_flag(flags: &mut [bool; LAYER_COUNT], index: usize) {
 
 fn flag(flags: &[bool; LAYER_COUNT], index: usize) -> bool {
 	flags.get(index).copied().unwrap_or(false)
+}
+
+/// One real-time performance summary, as written to the log.
+///
+/// These are measured on the live event loop (`WaitUntil` pacing, vsync, and
+/// presentation included), so the daily log of a 30-minute show run is the record
+/// of the SPEC §11 real-time acceptance criterion, unlike the headless throughput
+/// benchmarks in `tests/gpu_pipeline.rs`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PerfReport {
+	/// `true` for the whole-session summary written on exit.
+	pub session: bool,
+	/// Wall time the report covers.
+	pub elapsed: Duration,
+	/// Frames ticked in the covered span.
+	pub frames: u64,
+	/// Frames dropped in the covered span.
+	pub dropped: u64,
+	/// Longest interval between two ticks in the covered span.
+	pub worst_interval: Duration,
+	/// Frames dropped since launch.
+	pub dropped_total: u64,
+	/// Time since launch.
+	pub uptime: Duration,
+}
+
+impl PerfReport {
+	/// Average ticks per second over the covered span.
+	pub fn average_fps(&self) -> f64 {
+		let secs = self.elapsed.as_secs_f64();
+		if secs > 0.0 { self.frames as f64 / secs } else { 0.0 }
+	}
+
+	fn log(&self) {
+		tracing::info!(
+			target: "perf",
+			session = self.session,
+			avg_fps = format!("{:.2}", self.average_fps()),
+			frames = self.frames,
+			dropped = self.dropped,
+			worst_interval_ms = format!("{:.2}", self.worst_interval.as_secs_f64() * 1000.0),
+			dropped_total = self.dropped_total,
+			uptime_secs = self.uptime.as_secs(),
+			"{}",
+			if self.session { "session performance summary" } else { "real-time performance" }
+		);
+	}
+}
+
+/// Accumulates tick statistics and emits a [`PerfReport`] every [`PERF_REPORT_INTERVAL`].
+#[derive(Debug, Clone)]
+pub struct PerfWindow {
+	launched: Instant,
+	window_start: Instant,
+	frames_at_start: u64,
+	dropped_at_start: u64,
+	worst_interval: Duration,
+	worst_interval_session: Duration,
+	last_total_frames: u64,
+	last_dropped: u64,
+}
+
+impl PerfWindow {
+	/// Starts measuring at `now`.
+	pub fn new(now: Instant) -> Self {
+		Self {
+			launched: now,
+			window_start: now,
+			frames_at_start: 0,
+			dropped_at_start: 0,
+			worst_interval: Duration::ZERO,
+			worst_interval_session: Duration::ZERO,
+			last_total_frames: 0,
+			last_dropped: 0,
+		}
+	}
+
+	/// Records one tick; returns a report once [`PERF_REPORT_INTERVAL`] elapsed.
+	///
+	/// `total_frames` and `dropped_total` are the running counters of
+	/// [`crate::model::app_state::PerformanceStats`] after this tick.
+	pub fn record(&mut self, now: Instant, dt: Duration, total_frames: u64, dropped_total: u64) -> Option<PerfReport> {
+		// The first tick's interval includes startup and is not a frame interval.
+		if total_frames > 1 {
+			self.worst_interval = self.worst_interval.max(dt);
+			self.worst_interval_session = self.worst_interval_session.max(dt);
+		}
+		self.last_total_frames = total_frames;
+		self.last_dropped = dropped_total;
+		let elapsed = now.saturating_duration_since(self.window_start);
+		if elapsed < PERF_REPORT_INTERVAL {
+			return None;
+		}
+		let report = PerfReport {
+			session: false,
+			elapsed,
+			frames: total_frames.saturating_sub(self.frames_at_start),
+			dropped: dropped_total.saturating_sub(self.dropped_at_start),
+			worst_interval: self.worst_interval,
+			dropped_total,
+			uptime: now.saturating_duration_since(self.launched),
+		};
+		self.window_start = now;
+		self.frames_at_start = total_frames;
+		self.dropped_at_start = dropped_total;
+		self.worst_interval = Duration::ZERO;
+		Some(report)
+	}
+
+	/// Whole-session summary since launch, written on exit.
+	pub fn session_summary(&self, now: Instant) -> PerfReport {
+		let uptime = now.saturating_duration_since(self.launched);
+		PerfReport {
+			session: true,
+			elapsed: uptime,
+			frames: self.last_total_frames,
+			dropped: self.last_dropped,
+			worst_interval: self.worst_interval_session,
+			dropped_total: self.last_dropped,
+			uptime,
+		}
+	}
 }
 
 /// Returns `true` when an autosave is due at `now` and restarts the debounce window.
@@ -1172,6 +1296,7 @@ struct App {
 	runtime: Option<Runtime>,
 	fatal_error: Option<MurError>,
 	exit_saved: bool,
+	perf_window: PerfWindow,
 }
 
 /// Runs MUR until the operator confirms exit.
@@ -1266,6 +1391,7 @@ impl App {
 			runtime: None,
 			fatal_error: None,
 			exit_saved: false,
+			perf_window: PerfWindow::new(Instant::now()),
 		}
 	}
 
@@ -1485,6 +1611,7 @@ impl App {
 			return;
 		}
 		self.writer.shutdown();
+		self.perf_window.session_summary(Instant::now()).log();
 		let snapshot = capture_persisted(&self.state, &self.library);
 		match save_state_atomic(&self.state_path, &snapshot) {
 			Ok(()) => tracing::info!(target: "app", "state saved to {}", self.state_path.display()),
@@ -2305,6 +2432,13 @@ impl App {
 			let missed = (dt.as_secs_f64() / TARGET_FRAME.as_secs_f64()).floor() as u64;
 			perf.dropped_frames = perf.dropped_frames.saturating_add(missed.saturating_sub(1).max(1));
 		}
+		let (total_frames, dropped_frames) = (perf.total_frames, perf.dropped_frames);
+		if let Some(report) = self
+			.perf_window
+			.record(Instant::now(), dt, total_frames, dropped_frames)
+		{
+			report.log();
+		}
 	}
 
 	fn persist(&mut self) {
@@ -3109,6 +3243,41 @@ mod tests {
 		assert!(!command_allows_key_repeat(&UiCommand::TriggerLayer(LayerIndex::ALL[0])));
 		assert!(!command_allows_key_repeat(&UiCommand::ToggleBlackout));
 		assert!(!command_allows_key_repeat(&UiCommand::RequestExit));
+	}
+
+	#[test]
+	fn perf_window_reports_once_per_interval() {
+		let start = Instant::now();
+		let mut window = PerfWindow::new(start);
+		let frame = TARGET_FRAME;
+		// The first tick includes startup and never counts as the worst interval.
+		assert!(window.record(start, Duration::from_secs(2), 1, 0).is_none());
+		let mut now = start;
+		let mut report = None;
+		for tick in 2..=3700_u64 {
+			now += frame;
+			let dt = if tick == 100 { frame * 3 } else { frame };
+			let dropped = u64::from(tick >= 100) * 2;
+			if let Some(found) = window.record(now, dt, tick, dropped) {
+				report = Some((tick, found));
+				break;
+			}
+		}
+		let (tick, report) = report.expect("a report after one interval");
+		assert!(!report.session);
+		assert!(report.elapsed >= PERF_REPORT_INTERVAL);
+		assert_eq!(report.frames, tick);
+		assert_eq!(report.dropped, 2);
+		assert_eq!(report.worst_interval, frame * 3);
+		assert!((report.average_fps() - 60.0).abs() < 0.5, "{}", report.average_fps());
+
+		// The next window starts fresh.
+		assert!(window.record(now + frame, frame, tick + 1, 2).is_none());
+		let summary = window.session_summary(now + frame);
+		assert!(summary.session);
+		assert_eq!(summary.frames, tick + 1);
+		assert_eq!(summary.dropped_total, 2);
+		assert_eq!(summary.worst_interval, frame * 3);
 	}
 
 	#[test]

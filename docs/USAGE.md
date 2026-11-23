@@ -405,6 +405,20 @@ MUR scales each layer to fit inside the `1920×1080` canvas while preserving its
 
 Logs rotate daily (`mur.log.YYYY-MM-DD`) and retain up to **14 files**. Default verbosity is `info`; set `RUST_LOG=debug` (or `RUST_LOG=mur=debug`) before launch for verbose diagnostics.
 
+### Real-Time Performance Log & 30-Minute Acceptance Run (SPEC §11)
+
+While MUR runs, it writes a `real-time performance` line (log target `perf`) every **60 s** and a `session performance summary` on exit, measured on the live event loop (frame pacing, vsync, and presentation included):
+
+```text
+INFO perf: real-time performance session=false avg_fps="59.98" frames=3599 dropped=0 worst_interval_ms="17.41" dropped_total=0 uptime_secs=1800
+```
+
+The headless benchmarks in `tests/gpu_pipeline.rs` (`four_layer_fhd_sustained_60fps_budget`, `soak_four_layer_sustained_with_midi`) render as fast as possible without the event loop, vsync, or a window, so they measure **throughput headroom**, not real-time 60 fps. The SPEC §11 criterion is accepted on the production Mac with a real run:
+
+1. Build and launch the release binary with four FHD 60 fps HAP clips and the Launch Control XL 3 connected: `cargo run --release -- --folder <clips>`.
+2. Turn output on to the external display, trigger all four layers, enable master effects, and keep operating the controller for **30 minutes**.
+3. Quit (confirming the exit guard) and keep the day's `mur.log.YYYY-MM-DD`: every `real-time performance` line should show `avg_fps` ≈ 60 and `dropped=0` (or a documented, explained count), and the `session performance summary` records the whole run.
+
 ### Common Scenarios
 
 - **MIDI Controller Not Responding**:

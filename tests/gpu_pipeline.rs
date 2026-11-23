@@ -983,6 +983,13 @@ fn prime_full_clip(streamer: &mur::media::LayerStreamer, clips: &[(ClipId, mur::
 	}
 }
 
+/// Headless four-layer FHD upload + composite **throughput** benchmark.
+///
+/// Frames are rendered back to back without a window, vsync, or the
+/// `WaitUntil` event loop, so this proves per-frame GPU headroom below the
+/// 16.67 ms budget, not real-time 60 fps presentation. The real-time SPEC §11
+/// criterion is measured on the production machine from the app's `perf` log
+/// (see `docs/USAGE.md` §8).
 #[test]
 fn four_layer_fhd_sustained_60fps_budget() {
 	let _guard = gpu_lock();
@@ -1361,6 +1368,10 @@ fn soak_duration() -> std::time::Duration {
 }
 
 /// Long-running four-layer soak with live MIDI traffic.
+///
+/// Like [`four_layer_fhd_sustained_60fps_budget`] this runs headless and as fast
+/// as possible: it checks stability and throughput over time, not real-time
+/// presentation, which is verified with the real app (`docs/USAGE.md` §8).
 ///
 /// Run with `MUR_SOAK_SECS=600 cargo test --release --test gpu_pipeline -- --ignored`,
 /// or `MUR_SOAK_SECS=60` for a quick smoke run.
