@@ -615,19 +615,19 @@ pub fn capture_persisted(state: &AppState, library: &ClipLibrary) -> PersistedSt
 
 /// Auto-selects the first external display when no output display is chosen yet.
 ///
-/// When `restored` is `false` (first launch) the output is also switched on. With no
-/// external display the output stays off, so a single-display setup never hides the
-/// control window. Returns `true` when a display was selected.
-pub fn auto_select_output(output: &mut OutputDisplaySelection, monitors: &[MonitorSummary], restored: bool) -> bool {
+/// The display is only *selected*: output is never switched on automatically, so
+/// launching MUR at a venue never grabs a projector or LED processor before the
+/// operator turns output on (`Output ON` / `Ctrl+O`). Output that was enabled in a
+/// restored session or a project stays enabled. With no external display the output
+/// stays off, so a single-display setup never hides the control window. Returns
+/// `true` when a display was selected.
+pub fn auto_select_output(output: &mut OutputDisplaySelection, monitors: &[MonitorSummary]) -> bool {
 	if output.monitor_name.is_some() {
 		return false;
 	}
 	match platform::pick_default_external_monitor(monitors) {
 		Some(monitor) => {
 			output.monitor_name = Some(monitor.id.clone());
-			if !restored {
-				output.enabled = true;
-			}
 			true
 		}
 		None => {
@@ -1155,7 +1155,6 @@ struct App {
 	saver: StateSaver,
 	writer: StateWriter,
 	save_error_reported: bool,
-	restored: bool,
 	startup_requests: Vec<LoadRequest>,
 	runtime: Option<Runtime>,
 	fatal_error: Option<MurError>,
@@ -1192,14 +1191,12 @@ impl App {
 		let mut state = AppState::default();
 		let mut library = ClipLibrary::new();
 		let mut startup_requests = Vec::new();
-		let mut restored = false;
 		let mut startup_notices: Vec<(ToastLevel, String, String)> = Vec::new();
 
 		if !args.no_restore {
 			match load_state(&state_path) {
 				Ok(Some(persisted)) => {
 					startup_requests.extend(apply_persisted_state(&mut state, &mut library, &persisted));
-					restored = true;
 					tracing::info!(target: "app", "restored state from {}", state_path.display());
 				}
 				Ok(None) => tracing::info!(target: "app", "no saved state at {}", state_path.display()),
@@ -1252,7 +1249,6 @@ impl App {
 			saver: StateSaver::with_default_debounce(),
 			writer: StateWriter::spawn(),
 			save_error_reported: false,
-			restored,
 			startup_requests,
 			runtime: None,
 			fatal_error: None,
@@ -1301,7 +1297,7 @@ impl App {
 
 		let monitors = platform::collect_monitors(event_loop);
 		self.state.available_monitors = platform::summaries(&monitors);
-		if auto_select_output(&mut self.state.output, &self.state.available_monitors, self.restored) {
+		if auto_select_output(&mut self.state.output, &self.state.available_monitors) {
 			tracing::info!(target: "app", monitor = ?self.state.output.monitor_name, "auto-selected output display");
 			self.state.dirty = true;
 		}
@@ -3088,27 +3084,30 @@ mod tests {
 	}
 
 	#[test]
-	fn auto_select_prefers_external_and_never_enables_single_display() {
+	fn auto_select_prefers_external_and_never_enables_output() {
 		let mut output = OutputDisplaySelection::default();
-		assert!(!auto_select_output(&mut output, &[monitor("Built-in", true)], false));
+		assert!(!auto_select_output(&mut output, &[monitor("Built-in", true)]));
 		assert!(!output.enabled);
 		assert!(output.monitor_name.is_none());
 
 		let monitors = [monitor("Built-in", true), monitor("Projector", false)];
 		let mut fresh = OutputDisplaySelection::default();
-		assert!(auto_select_output(&mut fresh, &monitors, false));
+		assert!(auto_select_output(&mut fresh, &monitors));
 		assert_eq!(fresh.monitor_name.as_deref(), Some("Projector"));
-		assert!(fresh.enabled);
+		assert!(!fresh.enabled, "first launch only selects the display");
 
-		let mut restored = OutputDisplaySelection::default();
-		assert!(auto_select_output(&mut restored, &monitors, true));
-		assert!(!restored.enabled, "a restored disabled output stays disabled");
+		let mut enabled = OutputDisplaySelection {
+			monitor_name: None,
+			enabled: true,
+		};
+		assert!(auto_select_output(&mut enabled, &monitors));
+		assert!(enabled.enabled, "an output the operator enabled stays enabled");
 
 		let mut chosen = OutputDisplaySelection {
 			monitor_name: Some("Other".to_owned()),
 			enabled: true,
 		};
-		assert!(!auto_select_output(&mut chosen, &monitors, true));
+		assert!(!auto_select_output(&mut chosen, &monitors));
 		assert_eq!(chosen.monitor_name.as_deref(), Some("Other"));
 	}
 

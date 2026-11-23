@@ -98,7 +98,7 @@ MUR renders internally at **1920×1080 @ 60 fps** and scales the master output a
 ### Single-Display Safety
 
 - On first launch with only one monitor connected, MUR leaves output **disabled** (`Auto / None`) so the borderless output window never covers the control UI.
-- When an external monitor is connected at first launch, `Auto / None` selects the first non-primary display and enables output automatically.
+- When an external monitor is connected at first launch, `Auto / None` **selects** the first non-primary display but leaves output **off**, so launching MUR at a venue never grabs a projector or LED wall by surprise. Click `Output OFF` → `Output ON` (or press `Ctrl/Cmd + O`) when you are ready; the choice is saved and restored on the next launch.
 - If you explicitly choose the same monitor that holds the control window, MUR intentionally keeps the output window at normal window level instead of elevating it above all other windows.
 
 ### macOS Behavior
@@ -413,7 +413,7 @@ Logs rotate daily (`mur.log.YYYY-MM-DD`) and retain up to **14 files**. Default 
   - If an explicit port was saved or set via `preferred_midi_port`, MUR waits for that exact device (`Reconnecting`) instead of switching to a virtual/loopback port. Switch the dropdown back to `Auto (LCXL3)` to auto-detect any Launch Control port.
 - **External Monitor Unplugged or Blank**:
   - Check the `DISPLAY` status pill. If it shows `WAITING <monitor>`, reconnect the cable or select another display from the dropdown.
-  - If you only have one display connected, MUR keeps output disabled by default; manually select your monitor and click `Output OFF` → `Output ON` to test on a single screen.
+  - MUR never switches output on by itself: with an external display it is pre-selected, and with only one display you manually select your monitor; in both cases click `Output OFF` → `Output ON` to start presenting.
 - **Clip Shows `Error` in the Grid or Stops a Layer**:
   - Hover over the clip tile or check the `Logs` drawer (`G`) for the exact reason (e.g., unsupported codec such as H.264 or `HapM` / HAP Q Alpha, corrupt `moov` atom, dimensions exceeding `8192×8192`, or file deleted/moved during playback). Other clips and layers keep running unaffected.
 - **GPU Device Lost / Driver Reset**:
