@@ -117,6 +117,20 @@ fn decode_bc1_block(bytes: &[u8]) -> Block {
 	block
 }
 
+/// Decodes a BC1 block of RGB-only data (HAP RGB), forcing every pixel opaque.
+///
+/// HAP RGB has no alpha channel, so index 3 of a three-color block is plain
+/// black rather than BC1's punch-through transparent black.
+fn decode_bc1_opaque_block(bytes: &[u8]) -> Block {
+	let mut block = decode_bc1_block(bytes);
+	for row in &mut block {
+		for pixel in row.as_chunks_mut::<4>().0 {
+			pixel[3] = 255;
+		}
+	}
+	block
+}
+
 fn decode_bc3_block(bytes: &[u8]) -> Block {
 	let mut block = [[0u8; 16]; 4];
 	let (Some(alpha), Some(color)) = (bytes.get(..8).and_then(split8), bytes.get(8..16).and_then(split8)) else {
@@ -223,6 +237,14 @@ pub fn decode_bc1_to_rgba8(data: &[u8], width: u32, height: u32) -> Result<Vec<u
 	decode_blocks(data, width, height, 8, decode_bc1_block)
 }
 
+/// Decodes RGB-only BC1 blocks (HAP RGB) to tightly packed, fully opaque RGBA8.
+///
+/// Unlike [`decode_bc1_to_rgba8`], index 3 of three-color blocks decodes as
+/// opaque black, matching the GPU path which ignores BC1 alpha for HAP RGB.
+pub fn decode_bc1_opaque_to_rgba8(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, MediaError> {
+	decode_blocks(data, width, height, 8, decode_bc1_opaque_block)
+}
+
 /// Decodes BC3/DXT5 blocks to tightly packed RGBA8.
 pub fn decode_bc3_to_rgba8(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, MediaError> {
 	decode_blocks(data, width, height, 16, decode_bc3_block)
@@ -240,7 +262,8 @@ pub fn decode_bc3_ycocg_to_rgba8(data: &[u8], width: u32, height: u32) -> Result
 /// Converts any decoded frame payload to RGBA8.
 pub fn decode_frame_to_rgba8(frame: &DecodedFrame) -> Result<Vec<u8>, MediaError> {
 	let result = match &frame.payload {
-		PixelPayload::Bc1(data) => decode_bc1_to_rgba8(data, frame.width, frame.height),
+		// BC1 payloads only come from HAP RGB, which carries no alpha.
+		PixelPayload::Bc1(data) => decode_bc1_opaque_to_rgba8(data, frame.width, frame.height),
 		PixelPayload::Bc3(data) => decode_bc3_to_rgba8(data, frame.width, frame.height),
 		PixelPayload::Bc3YCoCg(data) => decode_bc3_ycocg_to_rgba8(data, frame.width, frame.height),
 		PixelPayload::Rgba8(data) => {
@@ -358,6 +381,27 @@ mod tests {
 		let rgba = decode_bc1_to_rgba8(&block, 4, 4).unwrap();
 		assert_eq!(pixel(&rgba, 4, 2, 0), [127, 127, 127, 255]);
 		assert_eq!(pixel(&rgba, 4, 3, 0), [0, 0, 0, 0]);
+	}
+
+	#[test]
+	fn hap_rgb_three_color_black_is_opaque() {
+		let mut block = [0u8; 8];
+		block[..2].copy_from_slice(&0x0000u16.to_le_bytes());
+		block[2..4].copy_from_slice(&0xFFFFu16.to_le_bytes());
+		block[4] = 0b11_10_01_00;
+		let rgba = decode_bc1_opaque_to_rgba8(&block, 4, 4).unwrap();
+		assert_eq!(pixel(&rgba, 4, 2, 0), [127, 127, 127, 255]);
+		assert_eq!(pixel(&rgba, 4, 3, 0), [0, 0, 0, 255]);
+
+		// Frame dispatch treats BC1 payloads as HAP RGB.
+		let frame = DecodedFrame {
+			frame_index: 0,
+			width: 4,
+			height: 4,
+			payload: PixelPayload::Bc1(block.to_vec()),
+		};
+		let rgba = decode_frame_to_rgba8(&frame).unwrap();
+		assert!(rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
 	}
 
 	#[test]

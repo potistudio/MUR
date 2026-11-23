@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use bc_decode::{
-	DEFAULT_THUMBNAIL_MAX_HEIGHT, DEFAULT_THUMBNAIL_MAX_WIDTH, create_thumbnail, decode_bc1_to_rgba8,
-	decode_bc3_to_rgba8, decode_bc3_ycocg_to_rgba8, decode_frame_to_rgba8,
+	DEFAULT_THUMBNAIL_MAX_HEIGHT, DEFAULT_THUMBNAIL_MAX_WIDTH, create_thumbnail, decode_bc1_opaque_to_rgba8,
+	decode_bc1_to_rgba8, decode_bc3_to_rgba8, decode_bc3_ycocg_to_rgba8, decode_frame_to_rgba8,
 };
 pub use hap::{decode_hap_frame, decode_hap_payload, expected_hap_bytes};
 pub use image_loader::{LoadedImage, load_image};

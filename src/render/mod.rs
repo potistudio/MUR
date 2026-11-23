@@ -405,7 +405,7 @@ impl MasterRenderer {
 					slot.uv_max(),
 					opacity,
 					input.blend_mode,
-					slot.is_ycocg(),
+					slot.encoding(),
 					input.is_opaque_margin,
 				));
 				report.layers_composited = report.layers_composited.saturating_add(1);

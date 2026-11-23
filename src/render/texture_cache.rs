@@ -41,6 +41,8 @@ pub struct UploadKey {
 	pub format: wgpu::TextureFormat,
 	/// Whether the texels hold DXT5-YCoCg data.
 	pub is_ycocg: bool,
+	/// Whether the texel alpha must be ignored (HAP RGB / BC1 data).
+	pub is_opaque: bool,
 }
 
 /// Reason a frame was refused before reaching the GPU.
@@ -131,6 +133,12 @@ pub struct UploadPlan {
 	pub uv_max: [f32; 2],
 	/// Whether the texels hold DXT5-YCoCg data.
 	pub is_ycocg: bool,
+	/// Whether the texel alpha must be ignored when compositing.
+	///
+	/// Set for BC1 (HAP RGB) uploads: HAP RGB has no alpha channel, but the
+	/// only BC1 format wgpu offers is `Bc1RgbaUnorm`, which decodes index 3 of
+	/// three-color blocks as transparent black. The shader forces alpha to 1.
+	pub is_opaque: bool,
 	/// Whether the payload must be decoded to RGBA8 on the CPU first.
 	pub needs_cpu_decode: bool,
 }
@@ -150,14 +158,14 @@ pub fn plan_upload(frame: &DecodedFrame, supports_bc: bool, max_dimension: u32) 
 	}
 
 	let block = match &frame.payload {
-		PixelPayload::Bc1(_) => Some((wgpu::TextureFormat::Bc1RgbaUnorm, BC1_BLOCK_BYTES, false)),
-		PixelPayload::Bc3(_) => Some((wgpu::TextureFormat::Bc3RgbaUnorm, BC3_BLOCK_BYTES, false)),
-		PixelPayload::Bc3YCoCg(_) => Some((wgpu::TextureFormat::Bc3RgbaUnorm, BC3_BLOCK_BYTES, true)),
+		PixelPayload::Bc1(_) => Some((wgpu::TextureFormat::Bc1RgbaUnorm, BC1_BLOCK_BYTES, false, true)),
+		PixelPayload::Bc3(_) => Some((wgpu::TextureFormat::Bc3RgbaUnorm, BC3_BLOCK_BYTES, false, false)),
+		PixelPayload::Bc3YCoCg(_) => Some((wgpu::TextureFormat::Bc3RgbaUnorm, BC3_BLOCK_BYTES, true, false)),
 		PixelPayload::Rgba8(_) => None,
 	};
 
 	match block {
-		Some((format, block_bytes, is_ycocg)) if supports_bc => {
+		Some((format, block_bytes, is_ycocg, is_opaque)) if supports_bc => {
 			let padded_w = width.div_ceil(4).saturating_mul(4);
 			let padded_h = height.div_ceil(4).saturating_mul(4);
 			if padded_w > max_dimension || padded_h > max_dimension {
@@ -174,6 +182,7 @@ pub fn plan_upload(frame: &DecodedFrame, supports_bc: bool, max_dimension: u32) 
 				expected_len: (bytes_per_row as usize).saturating_mul(rows_per_image as usize),
 				uv_max: [width as f32 / padded_w as f32, height as f32 / padded_h as f32],
 				is_ycocg,
+				is_opaque,
 				needs_cpu_decode: false,
 			})
 		}
@@ -188,6 +197,8 @@ pub fn plan_upload(frame: &DecodedFrame, supports_bc: bool, max_dimension: u32) 
 				expected_len: (bytes_per_row as usize).saturating_mul(height as usize),
 				uv_max: [1.0, 1.0],
 				is_ycocg: false,
+				// The CPU fallback decodes HAP RGB to opaque RGBA8 itself.
+				is_opaque: false,
 				needs_cpu_decode: other.is_some(),
 			})
 		}
@@ -228,6 +239,23 @@ impl LayerTextureSlot {
 	/// Whether the resident frame holds DXT5-YCoCg data.
 	pub fn is_ycocg(&self) -> bool {
 		self.content.is_some_and(|key| key.is_ycocg)
+	}
+
+	/// Whether the resident frame's texel alpha must be ignored (BC1 / HAP RGB).
+	pub fn is_opaque(&self) -> bool {
+		self.content.is_some_and(|key| key.is_opaque)
+	}
+
+	/// How the shader must interpret the resident frame's texels.
+	pub fn encoding(&self) -> super::compositor::TexelEncoding {
+		use super::compositor::TexelEncoding;
+		if self.is_ycocg() {
+			TexelEncoding::YCoCg
+		} else if self.is_opaque() {
+			TexelEncoding::OpaqueRgb
+		} else {
+			TexelEncoding::Rgba
+		}
 	}
 
 	/// Pixel size of the resident frame, excluding block padding.
@@ -370,6 +398,7 @@ impl LayerTextureCache {
 			height: frame.height,
 			format: plan.format,
 			is_ycocg: plan.is_ycocg,
+			is_opaque: plan.is_opaque,
 		};
 
 		let resident = self
@@ -507,6 +536,8 @@ mod tests {
 		assert_eq!(plan.expected_len, 480 * 8 * 270);
 		assert!((plan.uv_max[0] - 1918.0 / 1920.0).abs() < 1e-6);
 		assert!(!plan.needs_cpu_decode);
+		assert!(plan.is_opaque, "HAP RGB (BC1) ignores the BC1 punch-through alpha");
+		assert!(!plan.is_ycocg);
 	}
 
 	#[test]
@@ -517,6 +548,9 @@ mod tests {
 		assert_eq!(plan.bytes_per_row, 2 * 16);
 		assert_eq!(plan.expected_len, 2 * 16 * 2);
 		assert!(plan.is_ycocg);
+		assert!(!plan.is_opaque);
+		let alpha = plan_upload(&frame(6, 5, PixelPayload::Bc3(Vec::new())), true, 8192).unwrap();
+		assert!(!alpha.is_opaque && !alpha.is_ycocg);
 	}
 
 	#[test]
@@ -526,6 +560,7 @@ mod tests {
 		assert_eq!(plan.expected_len, 6 * 5 * 4);
 		assert!(plan.needs_cpu_decode);
 		assert!(!plan.is_ycocg);
+		assert!(!plan.is_opaque);
 	}
 
 	#[test]

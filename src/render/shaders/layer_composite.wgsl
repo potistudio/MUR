@@ -17,7 +17,10 @@ struct LayerUniform {
 	is_ycocg: u32,
 	// 1 when margins outside `src_rect` are opaque black, 0 when transparent.
 	opaque_margin: u32,
-	pad: vec2<u32>,
+	// 1 when the texel alpha must be ignored (HAP RGB uploaded as BC1, whose
+	// three-color blocks would otherwise decode index 3 as transparent black).
+	force_opaque: u32,
+	pad: u32,
 };
 
 struct VsOut {
@@ -73,6 +76,8 @@ fn fs_main(vin: VsOut) -> @location(0) vec4<f32> {
 	var src_a = texel.a;
 	if (layer.is_ycocg != 0u) {
 		src_rgb = ycocg_to_rgb(texel);
+		src_a = 1.0;
+	} else if (layer.force_opaque != 0u) {
 		src_a = 1.0;
 	}
 	src_a = src_a * layer.opacity;

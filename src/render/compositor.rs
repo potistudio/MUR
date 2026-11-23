@@ -16,6 +16,17 @@ use crate::model::layer::LAYER_COUNT;
 /// WGSL source of the layer compositing shader.
 pub const LAYER_COMPOSITE_WGSL: &str = include_str!("shaders/layer_composite.wgsl");
 
+/// How the compositing shader interprets a layer texture's texels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TexelEncoding {
+	/// Straight RGBA: the texel alpha is the layer alpha.
+	Rgba,
+	/// RGB without alpha (HAP RGB / BC1): the texel alpha is ignored.
+	OpaqueRgb,
+	/// DXT5-YCoCg (HAP Q), converted to opaque RGB in the shader.
+	YCoCg,
+}
+
 /// Per-layer uniform block mirrored by `LayerUniform` in `layer_composite.wgsl`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
@@ -32,8 +43,10 @@ pub struct LayerUniform {
 	pub is_ycocg: u32,
 	/// `1` when margins are opaque black, `0` when transparent.
 	pub opaque_margin: u32,
+	/// `1` when the texel alpha is ignored (HAP RGB / BC1), `0` otherwise.
+	pub force_opaque: u32,
 	/// Padding to a 16-byte multiple.
-	pub pad: [u32; 2],
+	pub pad: u32,
 }
 
 /// Parameters of one layer draw.
@@ -53,7 +66,7 @@ impl LayerDraw {
 		uv_max: [f32; 2],
 		opacity: f32,
 		blend_mode: BlendMode,
-		is_ycocg: bool,
+		encoding: TexelEncoding,
 		opaque_margin: bool,
 	) -> Self {
 		let opacity = if opacity.is_finite() {
@@ -68,9 +81,10 @@ impl LayerDraw {
 				uv_max,
 				opacity,
 				blend_mode: blend_mode.as_u32(),
-				is_ycocg: u32::from(is_ycocg),
+				is_ycocg: u32::from(encoding == TexelEncoding::YCoCg),
 				opaque_margin: u32::from(opaque_margin),
-				pad: [0; 2],
+				force_opaque: u32::from(encoding == TexelEncoding::OpaqueRgb),
+				pad: 0,
 			},
 		}
 	}

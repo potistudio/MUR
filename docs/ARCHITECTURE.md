@@ -100,8 +100,8 @@ All GPU rendering shares one `GpuContext` (`wgpu::Backends::PRIMARY`, `PowerPref
 
 1. **Texture Upload & BC / YCoCg Handling (`src/render/texture_cache.rs`)**:
    - `LayerTextureCache` holds four `LayerTextureSlot`s. Uploads are deduplicated by `UploadKey` `(clip_id, frame_index, width, height, format, is_ycocg)` and validated against `max_texture_dimension_2d` and exact byte lengths before `queue.write_texture`.
-   - When the adapter supports `wgpu::Features::TEXTURE_COMPRESSION_BC`, `Bc1` (`Bc1RgbaUnorm`), `Bc3` (`Bc3RgbaUnorm`), and `Bc3YCoCg` (`Bc3RgbaUnorm` + `is_ycocg = 1`) payloads upload directly as compressed GPU textures (padded to 4×4 block boundaries, with `uv_max` cropping edge padding).
-   - On adapters without `TEXTURE_COMPRESSION_BC`, `plan_upload` falls back to `Rgba8Unorm` using `CpuFallbackDecoder` (`bc_decode::decode_frame_to_rgba8`), which converts BC1/BC3/BC3-YCoCg blocks to RGBA8 on CPU.
+   - When the adapter supports `wgpu::Features::TEXTURE_COMPRESSION_BC`, `Bc1` (`Bc1RgbaUnorm` + `force_opaque = 1`), `Bc3` (`Bc3RgbaUnorm`), and `Bc3YCoCg` (`Bc3RgbaUnorm` + `is_ycocg = 1`) payloads upload directly as compressed GPU textures (padded to 4×4 block boundaries, with `uv_max` cropping edge padding). HAP RGB carries no alpha, so `force_opaque` makes the shader ignore BC1's punch-through alpha (index 3 of three-color blocks is opaque black, never transparent).
+   - On adapters without `TEXTURE_COMPRESSION_BC`, `plan_upload` falls back to `Rgba8Unorm` using `CpuFallbackDecoder` (`bc_decode::decode_frame_to_rgba8`), which converts BC1/BC3/BC3-YCoCg blocks to RGBA8 on CPU (BC1 is decoded fully opaque, matching the GPU path).
 
 2. **4-Layer Ping-Pong Compositor (`src/render/compositor.rs`, `src/render/shaders/layer_composite.wgsl`)**:
    - Preallocates two `1920×1080` `Rgba8Unorm` targets (`target_a`, `target_b`) and per-layer uniform buffers so the render loop performs zero GPU buffer allocations.

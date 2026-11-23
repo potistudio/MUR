@@ -421,6 +421,78 @@ fn hapq_gpu_ycocg_matches_cpu_decode_and_cpu_fallback_path() {
 	);
 }
 
+/// HAP RGB (BC1) has no alpha: a three-color block whose index 3 is black must
+/// paint opaque black over lower layers on the GPU and on the CPU fallback.
+#[test]
+fn hap_rgb_three_color_black_is_opaque_over_lower_layers() {
+	let _guard = gpu_lock();
+	let Some(ctx) = gpu_context("hap_rgb_opaque") else {
+		return;
+	};
+	let mut renderer = MasterRenderer::new(&ctx).unwrap();
+	renderer.set_cpu_fallback_decoder(cpu_bc_decoder);
+
+	let lower = solid_frame(ClipKind::Hap, 16, 9, [255, 255, 255], 255);
+	// c0 <= c1 selects three-color mode; every pixel uses index 3 (black).
+	let mut block = [0_u8; 8];
+	block[..2].copy_from_slice(&0x0000_u16.to_le_bytes());
+	block[2..4].copy_from_slice(&0xFFFF_u16.to_le_bytes());
+	block[4..8].copy_from_slice(&[0xFF; 4]);
+	let mut data = Vec::new();
+	for _ in 0..(4 * 3) {
+		data.extend_from_slice(&block);
+	}
+	let top = DecodedFrame {
+		frame_index: 0,
+		width: 16,
+		height: 9,
+		payload: PixelPayload::Bc1(data),
+	};
+	let cpu_pixels = decode_frame_to_rgba8(&top).unwrap();
+	assert_eq!(
+		pixel_at(&cpu_pixels, 16, 8, 4),
+		[0, 0, 0, 255],
+		"CPU fallback keeps black opaque"
+	);
+	let cpu_top = DecodedFrame {
+		frame_index: 1,
+		width: 16,
+		height: 9,
+		payload: PixelPayload::Rgba8(cpu_pixels),
+	};
+
+	for (label, frame) in [("BC1 upload", &top), ("CPU-decoded RGBA", &cpu_top)] {
+		let layers = [
+			LayerRenderInput {
+				frame: Some(&lower),
+				clip_id: Some(ClipId(41)),
+				opacity: 1.0,
+				blend_mode: BlendMode::Normal,
+				is_opaque_margin: true,
+			},
+			LayerRenderInput {
+				frame: Some(frame),
+				clip_id: Some(ClipId(42 + u64::from(frame.frame_index))),
+				opacity: 1.0,
+				blend_mode: BlendMode::Normal,
+				is_opaque_margin: true,
+			},
+			empty_input(),
+			empty_input(),
+		];
+		renderer
+			.render_master(&ctx, &layers, &MasterEffects::default(), 0.0)
+			.unwrap();
+		let pixels = renderer.readback_master_rgba8(&ctx).unwrap();
+		let center = master_pixel(&pixels, INTERNAL_WIDTH / 2, INTERNAL_HEIGHT / 2);
+		assert_eq!(
+			center,
+			[0, 0, 0, 255],
+			"{label}: HAP RGB black must hide the lower layer"
+		);
+	}
+}
+
 /// HAP Q blocks whose 5-bit scale (blue) expands to a value that is not a
 /// multiple of 8 must decode identically on the GPU and on the CPU fallback.
 #[test]
