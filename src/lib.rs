@@ -15,4 +15,5 @@ pub mod midi;
 pub mod model;
 pub mod platform;
 pub mod render;
+pub mod thread_util;
 pub mod ui;

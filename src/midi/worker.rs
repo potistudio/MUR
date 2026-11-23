@@ -38,6 +38,8 @@ pub const PORT_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 pub const RECONNECT_INTERVAL: Duration = Duration::from_millis(1000);
 /// Delay before the supervisor restarts a worker whose thread body panicked.
 pub const RESTART_BACKOFF: Duration = Duration::from_millis(500);
+/// Longest time dropping a [`MidiWorkerHandle`] waits for the worker to stop.
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Upper bound of the panic restart backoff.
 pub const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(8);
 /// Uptime after which the restart backoff drops back to [`RESTART_BACKOFF`].
@@ -147,8 +149,10 @@ fn is_virtual_port(port: &str) -> bool {
 
 /// Handle the UI keeps to receive MIDI events and steer the worker.
 ///
-/// Dropping the handle sends [`MidiCommand::Shutdown`] and joins the worker, so
-/// the port is always released before the application exits.
+/// Dropping the handle sends [`MidiCommand::Shutdown`] and joins the worker for
+/// up to [`SHUTDOWN_TIMEOUT`], so the port is released before the application
+/// exits; a worker wedged inside the OS MIDI backend is detached instead of
+/// hanging the quit.
 pub struct MidiWorkerHandle {
 	events: Receiver<MidiEvent>,
 	commands: Sender<MidiCommand>,
@@ -208,8 +212,13 @@ impl MidiWorkerHandle {
 impl Drop for MidiWorkerHandle {
 	fn drop(&mut self) {
 		let _ = self.commands.send(MidiCommand::Shutdown);
-		if let Some(thread) = self.thread.take() {
-			let _ = thread.join();
+		if let Some(thread) = self.thread.take()
+			&& !crate::thread_util::join_with_timeout(thread, SHUTDOWN_TIMEOUT)
+		{
+			tracing::warn!(
+				timeout_ms = SHUTDOWN_TIMEOUT.as_millis() as u64,
+				"MIDI worker did not stop in time; detaching it"
+			);
 		}
 	}
 }

@@ -886,6 +886,9 @@ pub fn load_clip_isolated(clip_id: ClipId, path: &Path) -> ClipLoadResult {
 	}
 }
 
+/// Longest time quitting waits for the state writer to flush its last snapshot.
+const STATE_WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Writes state snapshots off the render thread so `fsync` never drops a frame.
 struct StateWriter {
 	sender: Option<Sender<(PathBuf, PersistedState)>>,
@@ -952,10 +955,19 @@ impl StateWriter {
 	}
 
 	/// Stops the writer after it flushed pending snapshots.
+	///
+	/// Waits at most [`STATE_WRITER_SHUTDOWN_TIMEOUT`]: a save stuck in `fsync`
+	/// (dying disk, hung network volume) is detached so quitting never hangs.
 	fn shutdown(&mut self) {
 		self.sender = None;
-		if let Some(thread) = self.thread.take() {
-			let _ = thread.join();
+		if let Some(thread) = self.thread.take()
+			&& !crate::thread_util::join_with_timeout(thread, STATE_WRITER_SHUTDOWN_TIMEOUT)
+		{
+			tracing::warn!(
+				target: "app",
+				timeout_ms = STATE_WRITER_SHUTDOWN_TIMEOUT.as_millis() as u64,
+				"state writer did not finish in time; detaching it"
+			);
 		}
 	}
 }
