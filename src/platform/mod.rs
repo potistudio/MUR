@@ -316,6 +316,32 @@ pub fn find_monitor_by_handle<'a>(
 	monitors.iter().find(|monitor| &monitor.handle == handle)
 }
 
+/// Index of the first rectangle containing `point`, in physical desktop pixels.
+///
+/// Each rectangle is `(top_left, (width, height))`, as cached in
+/// [`MonitorDescriptor::position`] and its summary. Pure, so a window move can be
+/// mapped to a monitor without querying (possibly stale) handles.
+pub fn rect_index_containing(
+	rects: impl IntoIterator<Item = ((i32, i32), (u32, u32))>,
+	point: (i32, i32),
+) -> Option<usize> {
+	let (x, y) = (i64::from(point.0), i64::from(point.1));
+	rects.into_iter().position(|((left, top), (width, height))| {
+		let (left, top) = (i64::from(left), i64::from(top));
+		x >= left && y >= top && x < left + i64::from(width) && y < top + i64::from(height)
+	})
+}
+
+/// Id of the cached monitor containing `point`, if any.
+pub fn monitor_id_at(monitors: &[MonitorDescriptor], point: (i32, i32)) -> Option<&str> {
+	let rects = monitors
+		.iter()
+		.map(|monitor| (monitor.position, (monitor.summary.width, monitor.summary.height)));
+	rect_index_containing(rects, point)
+		.and_then(|index| monitors.get(index))
+		.map(|monitor| monitor.summary.id.as_str())
+}
+
 /// Clones the summaries out of `monitors`, e.g. for `AppState::available_monitors`.
 pub fn summaries<T: SummarizedMonitor>(monitors: &[T]) -> Vec<MonitorSummary> {
 	monitors.iter().map(|monitor| monitor.summary().clone()).collect()
@@ -735,6 +761,18 @@ mod tests {
 			summary("DELL U2720Q|3840x2160|3024,0", "DELL U2720Q", false),
 			summary("DELL U2720Q|3840x2160|6864,0", "DELL U2720Q", false),
 		]
+	}
+
+	#[test]
+	fn rect_index_containing_maps_points_to_monitors() {
+		let rects = [((0, 0), (1920_u32, 1080_u32)), ((1920, -200), (2560, 1440))];
+		assert_eq!(rect_index_containing(rects, (10, 10)), Some(0));
+		assert_eq!(rect_index_containing(rects, (1919, 1079)), Some(0));
+		assert_eq!(rect_index_containing(rects, (1920, 0)), Some(1));
+		assert_eq!(rect_index_containing(rects, (2000, -150)), Some(1));
+		assert_eq!(rect_index_containing(rects, (-5, 10)), None);
+		assert_eq!(rect_index_containing(rects, (100, 1080)), None);
+		assert_eq!(rect_index_containing([], (0, 0)), None);
 	}
 
 	#[test]

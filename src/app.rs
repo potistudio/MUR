@@ -1663,6 +1663,21 @@ impl App {
 		self.state.output_status = next;
 	}
 
+	/// Whether the control window, now at `position`, sits on a different cached
+	/// monitor than the one it was last identified on.
+	fn control_moved_to_another_monitor(&self, position: winit::dpi::PhysicalPosition<i32>) -> bool {
+		let Some(rt) = self.runtime.as_ref() else {
+			return false;
+		};
+		let size = rt.control.outer_size();
+		let half = |extent: u32| i32::try_from(extent / 2).unwrap_or(i32::MAX);
+		let center = (
+			position.x.saturating_add(half(size.width)),
+			position.y.saturating_add(half(size.height)),
+		);
+		platform::monitor_id_at(&rt.monitors, center).is_some_and(|id| rt.control_monitor_id.as_deref() != Some(id))
+	}
+
 	fn refresh_monitors(&mut self, event_loop: &ActiveEventLoop) {
 		let Some(rt) = self.runtime.as_mut() else {
 			return;
@@ -2437,10 +2452,15 @@ impl ApplicationHandler<AppEvent> for App {
 					self.refresh_monitors(event_loop);
 				}
 			}
-			WindowEvent::Moved(_) => {
-				// Re-enumerating also re-identifies the control display through the fresh
-				// monitor list and forces a re-placement when it changed.
-				self.refresh_monitors(event_loop);
+			WindowEvent::Moved(position) => {
+				// Dragging fires `Moved` continuously, so only re-enumerate when the
+				// control window crossed onto another display (judged from the cached
+				// monitor rectangles). Re-enumerating re-identifies the control display
+				// through the fresh list and forces a re-placement when it changed;
+				// anything else is caught by the periodic monitor poll.
+				if from_control && self.control_moved_to_another_monitor(*position) {
+					self.refresh_monitors(event_loop);
+				}
 			}
 			WindowEvent::RedrawRequested => {
 				let due = self
