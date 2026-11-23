@@ -280,8 +280,10 @@ impl ClipLibrary {
 			.clip_by_id(clip_id)
 			.is_some_and(|clip| clip.path.as_path() == path);
 		if !slot_matches {
-			// The clip was removed while it loaded; drop the result and its bindings.
-			self.pending_bindings.retain(|binding| binding.path != path);
+			// The clip was removed while it loaded: drop the result only. `forget`
+			// already dropped the bindings that waited for this slot, so any binding
+			// for `path` that exists now belongs to a newer load of the same file
+			// (e.g. a project re-queued it under a new id) and must survive.
 			return outcome;
 		}
 		outcome.accepted = true;
@@ -2825,6 +2827,36 @@ mod tests {
 		);
 		assert!(!outcome.accepted);
 		assert!(state.clips.is_empty());
+	}
+
+	#[test]
+	fn stale_load_result_keeps_the_binding_of_a_newer_load() {
+		let mut state = AppState::default();
+		let mut library = ClipLibrary::new();
+		let path = Path::new("/media/x.mov");
+		let old = library.enqueue(&mut state, path).unwrap();
+		apply_session_command(&mut state, &mut library, &UiCommand::RemoveClip(old.clip_id));
+		assert!(state.clip_by_id(old.clip_id).is_none());
+
+		// A project binds the same file to layer 1; it is re-queued under a new id.
+		let new = library.enqueue(&mut state, path).unwrap();
+		assert_ne!(new.clip_id, old.clip_id);
+		library.add_binding(PendingBinding {
+			layer: LayerIndex::ALL[0],
+			path: path.to_path_buf(),
+			playhead_frame: 0.0,
+			keep_selection: false,
+		});
+
+		// The stale result of the first load arrives first.
+		let outcome = library.complete(&mut state, old.clip_id, path, Ok(loaded_info("/media/x.mov", 10, 60.0)));
+		assert!(!outcome.accepted);
+		assert_eq!(library.pending_bindings().len(), 1, "newer binding survives");
+
+		let outcome = library.complete(&mut state, new.clip_id, path, Ok(loaded_info("/media/x.mov", 10, 60.0)));
+		assert!(outcome.accepted);
+		assert!(outcome.bound_layers[0]);
+		assert_eq!(state.layers[0].active_clip, Some(new.clip_id));
 	}
 
 	#[test]
