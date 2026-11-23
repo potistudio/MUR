@@ -81,6 +81,9 @@ pub fn load_image_from_memory(bytes: &[u8], path: &Path) -> Result<LoadedImage, 
 	let mut limits = image::Limits::default();
 	limits.max_image_width = Some(MAX_DIMENSION);
 	limits.max_image_height = Some(MAX_DIMENSION);
+	// Even a legal 8192×8192 RGBA image needs 256 MiB; leave headroom but stop
+	// the decoder before it can allocate gigabytes of intermediate buffers.
+	limits.max_alloc = Some(300 * 1024 * 1024);
 	reader.limits(limits);
 	let decoded = reader
 		.decode()

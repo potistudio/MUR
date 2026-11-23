@@ -38,7 +38,7 @@ use crate::config::{AppPaths, CliArgs, PersistedState, ProjectConfig, StateSaver
 use crate::error::{ConfigError, LogEntry, MurError, RenderError, ToastLevel};
 use crate::media::{self, ClipAsset, LayerStreamEvent, LayerStreamer};
 use crate::midi::{MidiEvent, MidiWorkerHandle, apply_midi_action};
-use crate::model::layer::{DEFAULT_CLIP_FPS, LAYER_COUNT};
+use crate::model::layer::{DEFAULT_CLIP_FPS, LAYER_COUNT, MAX_CLIP_FPS, MIN_CLIP_FPS};
 use crate::model::{
 	AppState, ClipId, ClipInfo, ClipKind, ClipStatus, DecodedFrame, LayerIndex, MidiConnectionStatus, MonitorSummary,
 	OutputDisplaySelection, OutputRuntimeStatus, PlaybackState,
@@ -61,6 +61,8 @@ pub const CLIP_LOADER_THREADS: usize = 2;
 pub const DIALOG_EXTENSIONS: [&str; 6] = ["mov", "png", "jpg", "jpeg", "toml", "json"];
 /// Title of the control window.
 pub const CONTROL_WINDOW_TITLE: &str = "MUR — Live VJ Control";
+/// Title of the control window while the GPU device is lost and being rebuilt.
+pub const GPU_LOST_WINDOW_TITLE: &str = "MUR — Control [GPU LOST — retrying...]";
 /// Title of the output window.
 pub const OUTPUT_WINDOW_TITLE: &str = "MUR — Output";
 
@@ -72,6 +74,10 @@ const PERF_EMA_ALPHA: f32 = 0.1;
 const SHADER_TIME_WRAP_SECS: f64 = 3600.0;
 /// Minimum spacing between two ticks triggered by `RedrawRequested`.
 const MIN_REDRAW_TICK_SPACING: Duration = Duration::from_millis(8);
+/// The control window presents without vsync so it can never stall the output frame.
+const CONTROL_PREFERS_VSYNC: bool = false;
+/// The audience output is locked to the display refresh to avoid tearing.
+const OUTPUT_PREFERS_VSYNC: bool = true;
 /// Background color behind the egui panels.
 const CONTROL_CLEAR_COLOR: wgpu::Color = wgpu::Color {
 	r: 0.063,
@@ -392,7 +398,7 @@ pub fn bind_layer_to_clip(state: &mut AppState, layer: LayerIndex, clip_id: Clip
 }
 
 fn sanitize_fps(fps: f32) -> f32 {
-	if fps.is_finite() && fps > 0.0 {
+	if (MIN_CLIP_FPS..=MAX_CLIP_FPS).contains(&fps) {
 		fps
 	} else {
 		DEFAULT_CLIP_FPS
@@ -414,6 +420,18 @@ fn set_flag(flags: &mut [bool; LAYER_COUNT], index: usize) {
 
 fn flag(flags: &[bool; LAYER_COUNT], index: usize) -> bool {
 	flags.get(index).copied().unwrap_or(false)
+}
+
+/// Returns `true` when an autosave is due at `now` and restarts the debounce window.
+///
+/// The saver keeps its configured debounce interval (it is never replaced by a default
+/// one); only the dirty flag and the last-save instant are reset.
+fn take_due_save(saver: &mut StateSaver, now: Instant) -> bool {
+	if !saver.is_due(now) {
+		return false;
+	}
+	saver.mark_saved(now);
+	true
 }
 
 // ================================================================ session setup
@@ -667,8 +685,9 @@ pub fn request_exit(state: &mut AppState) -> UiApplyOutcome {
 
 /// Returns `true` for commands that may repeat while a key is held.
 ///
-/// Continuous adjustments repeat; triggers, toggles, and the exit guard do not, so a held
-/// key can never machine-gun a retrigger or flip a toggle back and forth.
+/// Only continuous `Adjust*` commands repeat; triggers, toggles, clip stepping, layer focus
+/// cycling, and the exit guard do not, so a held key can never machine-gun a retrigger,
+/// race through the clip grid, or flip a toggle back and forth.
 pub fn command_allows_key_repeat(cmd: &UiCommand) -> bool {
 	matches!(
 		cmd,
@@ -682,8 +701,6 @@ pub fn command_allows_key_repeat(cmd: &UiCommand) -> bool {
 			| UiCommand::AdjustContrast(_)
 			| UiCommand::AdjustSaturation(_)
 			| UiCommand::AdjustMasterDimmer(_)
-			| UiCommand::StepLayerClip { .. }
-			| UiCommand::CycleFocusLayer(_)
 	)
 }
 
@@ -916,6 +933,9 @@ struct SurfaceSlot {
 	surface: wgpu::Surface<'static>,
 	config: Option<wgpu::SurfaceConfiguration>,
 	needs_reconfigure: bool,
+	/// `true` for the audience output (vsync), `false` for the control window, whose
+	/// presentation must never block the output frame.
+	prefer_vsync: bool,
 }
 
 /// Outcome of acquiring the next surface texture.
@@ -929,11 +949,12 @@ enum Acquire {
 }
 
 impl SurfaceSlot {
-	fn new(surface: wgpu::Surface<'static>) -> Self {
+	fn new(surface: wgpu::Surface<'static>, prefer_vsync: bool) -> Self {
 		Self {
 			surface,
 			config: None,
 			needs_reconfigure: true,
+			prefer_vsync,
 		}
 	}
 
@@ -946,7 +967,7 @@ impl SurfaceSlot {
 			.as_ref()
 			.is_none_or(|config| config.width != size.width || config.height != size.height);
 		if self.needs_reconfigure || size_changed {
-			match gpu.configure_surface(&self.surface, size.width, size.height) {
+			match gpu.configure_surface_with_vsync(&self.surface, size.width, size.height, self.prefer_vsync) {
 				Ok(config) => {
 					self.config = Some(config);
 					self.needs_reconfigure = false;
@@ -1017,7 +1038,7 @@ impl GpuStack {
 		Ok(Self {
 			egui_renderer,
 			master,
-			control: SurfaceSlot::new(surface),
+			control: SurfaceSlot::new(surface, CONTROL_PREFERS_VSYNC),
 			gpu,
 		})
 	}
@@ -1063,6 +1084,10 @@ struct Runtime {
 	next_frame_at: Instant,
 	last_gpu_error: Option<String>,
 	last_render_error: Option<String>,
+	/// Whether the control window title currently shows [`GPU_LOST_WINDOW_TITLE`].
+	title_shows_gpu_lost: bool,
+	/// Keeps macOS App Nap from throttling the tick while MUR runs.
+	_app_nap: platform::AppNapGuard,
 }
 
 // ======================================================================== app
@@ -1251,9 +1276,8 @@ impl App {
 		}));
 
 		let now = Instant::now();
-		let control_monitor_id = control
-			.current_monitor()
-			.map(|monitor| platform::monitor_summary(&monitor, None).id);
+		let control_monitor_id = platform::find_monitor_by_handle(&monitors, control.current_monitor().as_ref())
+			.map(|monitor| monitor.summary.id.clone());
 		self.runtime = Some(Runtime {
 			control,
 			control_occluded: false,
@@ -1280,6 +1304,8 @@ impl App {
 			next_frame_at: now,
 			last_gpu_error: None,
 			last_render_error: None,
+			title_shows_gpu_lost: false,
+			_app_nap: platform::prevent_app_nap(),
 		});
 
 		let requests = std::mem::take(&mut self.startup_requests);
@@ -1597,17 +1623,17 @@ impl App {
 			rt.needs_output_sync = true;
 			rt.force_placement = true;
 		}
+		// Identify the control display through the fresh list, never by querying its
+		// (possibly stale) handle directly.
+		let control_monitor_id = platform::find_monitor_by_handle(&monitors, rt.control.current_monitor().as_ref())
+			.map(|monitor| monitor.summary.id.clone());
 		rt.monitors = monitors;
-		let control_monitor_id = rt
-			.control
-			.current_monitor()
-			.map(|monitor| platform::monitor_summary(&monitor, None).id);
 		if control_monitor_id != rt.control_monitor_id {
 			rt.control_monitor_id = control_monitor_id;
 			rt.force_placement = true;
 			rt.needs_output_sync = true;
 		}
-		// Periodic reconcile also retries surface creation after transient errors.
+		// The follow-up reconcile also retries surface creation after transient errors.
 		rt.needs_output_sync = true;
 	}
 
@@ -1622,6 +1648,10 @@ impl App {
 	}
 
 	fn reconcile_output(&mut self, event_loop: &ActiveEventLoop) {
+		// Always decide on a fresh monitor list: a display unplugged since the last poll
+		// must neither be targeted through a stale handle nor pull the output onto the
+		// control display.
+		self.refresh_monitors(event_loop);
 		let Some(rt) = self.runtime.as_mut() else {
 			return;
 		};
@@ -1633,9 +1663,12 @@ impl App {
 			return;
 		}
 
-		let Some(desc) =
-			platform::find_matching_monitor(&rt.monitors, self.state.output.monitor_name.as_deref()).cloned()
-		else {
+		let Some(desc) = platform::find_matching_monitor_excluding(
+			&rt.monitors,
+			self.state.output.monitor_name.as_deref(),
+			rt.control_monitor_id.as_deref(),
+		)
+		.cloned() else {
 			self.drop_output();
 			let expected_name = self.state.output.monitor_name.clone();
 			self.set_output_status(OutputRuntimeStatus::WaitingForMonitor { expected_name });
@@ -1661,7 +1694,11 @@ impl App {
 		}
 
 		let force_placement = std::mem::take(&mut rt.force_placement);
-		let control_monitor = rt.control.current_monitor();
+		let control_monitor = rt
+			.control_monitor_id
+			.as_deref()
+			.and_then(|id| rt.monitors.iter().find(|monitor| monitor.summary.id == id))
+			.map(|monitor| monitor.handle.clone());
 		let Some(output) = rt.output.as_mut() else {
 			return;
 		};
@@ -1710,7 +1747,7 @@ impl App {
 				return;
 			};
 			match stack.gpu.create_surface(Arc::clone(&output.window)) {
-				Ok(surface) => output.surface = Some(SurfaceSlot::new(surface)),
+				Ok(surface) => output.surface = Some(SurfaceSlot::new(surface, OUTPUT_PREFERS_VSYNC)),
 				Err(error) => {
 					let message = error.to_string();
 					self.set_output_status(OutputRuntimeStatus::Error(message));
@@ -1811,12 +1848,13 @@ impl App {
 		self.state.toasts.prune_expired(self.state.elapsed_secs);
 
 		// Display hot-plug and output reconciliation.
-		let poll_due = self.runtime.as_ref().is_some_and(|rt| started >= rt.next_monitor_poll);
-		if poll_due {
-			if let Some(rt) = self.runtime.as_mut() {
-				rt.next_monitor_poll = started + MONITOR_POLL_INTERVAL;
-			}
-			self.refresh_monitors(event_loop);
+		// `reconcile_output` re-enumerates the monitors itself, so a due poll only has to
+		// request a reconcile.
+		if let Some(rt) = self.runtime.as_mut()
+			&& started >= rt.next_monitor_poll
+		{
+			rt.next_monitor_poll = started + MONITOR_POLL_INTERVAL;
+			rt.needs_output_sync = true;
 		}
 		if self.runtime.as_ref().is_some_and(|rt| rt.needs_output_sync) {
 			self.reconcile_output(event_loop);
@@ -1837,7 +1875,8 @@ impl App {
 		}
 
 		// 5-7. Streaming, master render, presentation.
-		let commands = self.render_frame();
+		let commands = self.render_frame_guarded();
+		self.update_control_title();
 		for command in &commands {
 			self.handle_command(event_loop, command);
 		}
@@ -1932,6 +1971,41 @@ impl App {
 	/// Syncs layers, renders the master frame, presents the output, then the control UI.
 	///
 	/// Returns the commands issued through the control UI this frame.
+	/// Runs [`App::render_frame`] with panic containment.
+	///
+	/// wgpu and egui-wgpu panic on some device-loss and validation paths. A panic inside
+	/// the frame marks the GPU as lost instead of unwinding out of the event loop, so the
+	/// regular recovery rebuilds the device (and the egui context) on the next tick.
+	fn render_frame_guarded(&mut self) -> Vec<UiCommand> {
+		match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.render_frame())) {
+			Ok(commands) => commands,
+			Err(payload) => {
+				let detail = panic_message(payload.as_ref());
+				tracing::error!(target: "render", "panic while rendering a frame: {detail}");
+				if let Some(rt) = self.runtime.as_mut() {
+					rt.gpu_lost = Some(format!("GPU frame panicked: {detail}"));
+				}
+				Vec::new()
+			}
+		}
+	}
+
+	/// Shows [`GPU_LOST_WINDOW_TITLE`] on the control window while the GPU is unavailable.
+	fn update_control_title(&mut self) {
+		let Some(rt) = self.runtime.as_mut() else {
+			return;
+		};
+		let lost = rt.gpu.is_none() || rt.gpu_lost.is_some();
+		if lost != rt.title_shows_gpu_lost {
+			rt.control.set_title(if lost {
+				GPU_LOST_WINDOW_TITLE
+			} else {
+				CONTROL_WINDOW_TITLE
+			});
+			rt.title_shows_gpu_lost = lost;
+		}
+	}
+
 	fn render_frame(&mut self) -> Vec<UiCommand> {
 		let Some(rt) = self.runtime.as_mut() else {
 			return Vec::new();
@@ -2031,7 +2105,7 @@ impl App {
 			Acquire::Skip => return Vec::new(),
 			Acquire::Lost => {
 				match stack.gpu.create_surface(Arc::clone(&rt.control)) {
-					Ok(surface) => stack.control = SurfaceSlot::new(surface),
+					Ok(surface) => stack.control = SurfaceSlot::new(surface, CONTROL_PREFERS_VSYNC),
 					Err(error) => rt.gpu_lost = Some(error.to_string()),
 				}
 				return Vec::new();
@@ -2067,6 +2141,17 @@ impl App {
 			size_in_pixels: [width, height],
 			pixels_per_point,
 		};
+		// The device may have been lost while egui ran; uploading textures or buffers to a
+		// lost device can panic inside egui-wgpu, so bail out into recovery first.
+		if stack.gpu.is_device_lost() {
+			rt.gpu_lost = Some(
+				stack
+					.gpu
+					.take_last_error()
+					.unwrap_or_else(|| "GPU device lost".to_owned()),
+			);
+			return commands;
+		}
 		let device = Arc::clone(&stack.gpu.device);
 		let queue = Arc::clone(&stack.gpu.queue);
 		for (id, deltas) in &full_output.textures_delta.set {
@@ -2146,13 +2231,10 @@ impl App {
 		if let Some(error) = self.writer.take_error() {
 			self.report_save_error(error);
 		}
-		let now = Instant::now();
-		if !self.saver.is_due(now) {
+		if !take_due_save(&mut self.saver, Instant::now()) {
 			return;
 		}
 		let snapshot = capture_persisted(&self.state, &self.library);
-		// A fresh saver restarts the debounce window with a clean dirty flag.
-		self.saver = StateSaver::with_default_debounce();
 		match self.writer.submit(&self.state_path, snapshot) {
 			Ok(()) => self.save_error_reported = false,
 			Err(error) => self.report_save_error(error.to_string()),
@@ -2274,31 +2356,26 @@ impl ApplicationHandler<AppEvent> for App {
 				}
 			}
 			WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+				let scale_changed = matches!(event, WindowEvent::ScaleFactorChanged { .. });
 				if let Some(rt) = self.runtime.as_mut() {
 					if from_output {
 						if let Some(slot) = rt.output.as_mut().and_then(|output| output.surface.as_mut()) {
 							slot.needs_reconfigure = true;
 						}
-						rt.needs_output_sync = true;
 					} else {
 						rt.control.request_redraw();
 					}
 				}
+				// Output resizes and DPI changes usually mean the display layout changed
+				// (hot-unplug, resolution switch): re-enumerate right away.
+				if from_output || scale_changed {
+					self.refresh_monitors(event_loop);
+				}
 			}
 			WindowEvent::Moved(_) => {
-				if let Some(rt) = self.runtime.as_mut() {
-					rt.needs_output_sync = true;
-					if from_control {
-						let monitor_id = rt
-							.control
-							.current_monitor()
-							.map(|monitor| platform::monitor_summary(&monitor, None).id);
-						if monitor_id != rt.control_monitor_id {
-							rt.control_monitor_id = monitor_id;
-							rt.force_placement = true;
-						}
-					}
-				}
+				// Re-enumerating also re-identifies the control display through the fresh
+				// monitor list and forces a re-placement when it changed.
+				self.refresh_monitors(event_loop);
 			}
 			WindowEvent::RedrawRequested => {
 				let due = self
@@ -2333,6 +2410,17 @@ impl ApplicationHandler<AppEvent> for App {
 	}
 }
 
+/// Extracts a readable message from a panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+	if let Some(message) = payload.downcast_ref::<&str>() {
+		(*message).to_owned()
+	} else if let Some(message) = payload.downcast_ref::<String>() {
+		message.clone()
+	} else {
+		"unknown panic".to_owned()
+	}
+}
+
 /// Creates the egui-winit input state for the control window.
 fn new_egui_state(ctx: &egui::Context, window: &Window, max_texture_side: usize) -> egui_winit::State {
 	egui_winit::State::new(
@@ -2347,16 +2435,18 @@ fn new_egui_state(ctx: &egui::Context, window: &Window, max_texture_side: usize)
 
 /// Creates the (initially hidden) output window on `desc`'s monitor.
 fn create_output_window(event_loop: &ActiveEventLoop, desc: &MonitorDescriptor) -> Result<Arc<Window>, String> {
-	let position = desc.handle.position();
-	let size = desc.handle.size();
+	// Cached geometry: the live handle may already be stale (and winit panics on Windows
+	// when querying a stale `HMONITOR`).
+	let (x, y) = desc.position;
+	let (width, height) = (desc.summary.width, desc.summary.height);
 	let attributes = WindowAttributes::default()
 		.with_title(OUTPUT_WINDOW_TITLE)
 		.with_decorations(false)
 		.with_resizable(false)
 		.with_active(false)
 		.with_visible(false)
-		.with_position(PhysicalPosition::new(position.x, position.y))
-		.with_inner_size(PhysicalSize::new(size.width.max(1), size.height.max(1)));
+		.with_position(PhysicalPosition::new(x, y))
+		.with_inner_size(PhysicalSize::new(width.max(1), height.max(1)));
 	event_loop
 		.create_window(attributes)
 		.map(Arc::new)
@@ -2766,12 +2856,48 @@ mod tests {
 	}
 
 	#[test]
+	fn autosave_keeps_custom_debounce_across_saves() {
+		let debounce = Duration::from_secs(30);
+		let mut saver = StateSaver::new(debounce);
+		let start = saver.last_save();
+		saver.mark_dirty();
+		assert!(!take_due_save(&mut saver, start + Duration::from_secs(29)));
+		let first = start + debounce;
+		assert!(take_due_save(&mut saver, first));
+		assert!(!saver.is_dirty());
+		assert_eq!(saver.last_save(), first);
+
+		// The next save again waits the full custom interval, not the default one.
+		saver.mark_dirty();
+		assert!(!take_due_save(&mut saver, first + Duration::from_secs(29)));
+		assert!(saver.is_dirty());
+		assert!(take_due_save(&mut saver, first + debounce));
+		assert!(!take_due_save(&mut saver, first + debounce + Duration::from_secs(60)));
+	}
+
+	#[test]
+	fn sanitize_fps_uses_model_bounds() {
+		assert_eq!(sanitize_fps(29.97), 29.97);
+		assert_eq!(sanitize_fps(MIN_CLIP_FPS), MIN_CLIP_FPS);
+		assert_eq!(sanitize_fps(MAX_CLIP_FPS), MAX_CLIP_FPS);
+		assert_eq!(sanitize_fps(0.5), DEFAULT_CLIP_FPS);
+		assert_eq!(sanitize_fps(5000.0), DEFAULT_CLIP_FPS);
+		assert_eq!(sanitize_fps(f32::NAN), DEFAULT_CLIP_FPS);
+		assert_eq!(sanitize_fps(-1.0), DEFAULT_CLIP_FPS);
+	}
+
+	#[test]
 	fn key_repeat_only_for_continuous_commands() {
 		assert!(command_allows_key_repeat(&UiCommand::AdjustMasterDimmer(0.05)));
-		assert!(command_allows_key_repeat(&UiCommand::StepLayerClip {
+		assert!(command_allows_key_repeat(&UiCommand::AdjustLayerOpacity {
+			layer: LayerIndex::ALL[0],
+			delta: 0.05
+		}));
+		assert!(!command_allows_key_repeat(&UiCommand::StepLayerClip {
 			layer: LayerIndex::ALL[0],
 			delta: 1
 		}));
+		assert!(!command_allows_key_repeat(&UiCommand::CycleFocusLayer(1)));
 		assert!(!command_allows_key_repeat(&UiCommand::TriggerLayer(LayerIndex::ALL[0])));
 		assert!(!command_allows_key_repeat(&UiCommand::ToggleBlackout));
 		assert!(!command_allows_key_repeat(&UiCommand::RequestExit));

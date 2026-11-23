@@ -8,16 +8,21 @@
 //! The monitor bounds are read back through `GetMonitorInfoW` both to detect a monitor
 //! that disappeared and to report the exact placement.
 //!
+//! winit's `MonitorHandle::name` and `MonitorHandle::size` unwrap `GetMonitorInfoW` and
+//! panic once a display was unplugged (stale `HMONITOR`). MUR therefore never calls them:
+//! [`monitor_info`] reads the device name and bounds itself and reports `None` for a
+//! vanished monitor.
+//!
 //! Exit requests need no native hook here: `Alt+F4`, the close button, and the system
 //! menu all arrive as `WindowEvent::CloseRequested`.
 
 use windows_sys::Win32::Foundation::RECT;
-use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
+use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO, MONITORINFOEXW};
 use winit::monitor::MonitorHandle;
 use winit::platform::windows::MonitorHandleExtWindows;
 use winit::window::{Fullscreen, Window, WindowLevel};
 
-use super::{OutputPlacement, PlatformError, sanitize_scale_factor};
+use super::{DISCONNECTED_DISPLAY_NAME, OutputPlacement, PlatformError, sanitize_scale_factor};
 
 /// Bounds of a monitor in physical desktop pixels, as reported by `GetMonitorInfoW`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,33 +53,68 @@ fn rect_tuple(rect: RECT) -> (i32, i32, i32, i32) {
 	(rect.left, rect.top, rect.right, rect.bottom)
 }
 
-/// Queries the physical bounds of `monitor`; `None` when the monitor is no longer attached.
-pub fn monitor_bounds(monitor: &MonitorHandle) -> Option<MonitorBounds> {
+/// Bounds plus GDI device name of a connected monitor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorInfo {
+	/// Physical bounds and primary flag.
+	pub bounds: MonitorBounds,
+	/// GDI device name such as `\\.\DISPLAY2`; `None` when Windows reports none.
+	pub device_name: Option<String>,
+}
+
+/// Decodes a NUL-terminated UTF-16 buffer.
+fn decode_wide(buffer: &[u16]) -> String {
+	let end = buffer.iter().position(|&unit| unit == 0).unwrap_or(buffer.len());
+	String::from_utf16_lossy(buffer.get(..end).unwrap_or_default())
+}
+
+/// Queries bounds and device name of `monitor`; `None` when it is no longer attached.
+///
+/// Never panics on a stale `HMONITOR`, unlike winit's `MonitorHandle::name` / `size`.
+pub fn monitor_info(monitor: &MonitorHandle) -> Option<MonitorInfo> {
 	let empty = RECT {
 		left: 0,
 		top: 0,
 		right: 0,
 		bottom: 0,
 	};
-	let mut info = MONITORINFO {
-		cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).unwrap_or(0),
-		rcMonitor: empty,
-		rcWork: empty,
-		dwFlags: 0,
+	let mut info = MONITORINFOEXW {
+		monitorInfo: MONITORINFO {
+			cbSize: u32::try_from(std::mem::size_of::<MONITORINFOEXW>()).unwrap_or(0),
+			rcMonitor: empty,
+			rcWork: empty,
+			dwFlags: 0,
+		},
+		szDevice: [0; 32],
 	};
 	let hmonitor = monitor.hmonitor() as HMONITOR;
-	// SAFETY: `info` is a properly sized, writable `MONITORINFO` with `cbSize` set, and
-	// `GetMonitorInfoW` tolerates stale monitor handles by returning `FALSE`.
-	let ok = unsafe { GetMonitorInfoW(hmonitor, &mut info) };
+	// SAFETY: `info` is a properly sized, writable `MONITORINFOEXW` whose embedded
+	// `MONITORINFO` comes first (`#[repr(C)]`) and whose `cbSize` announces the extended
+	// layout, so `GetMonitorInfoW` may fill `szDevice`. Stale monitor handles make it
+	// return `FALSE` instead of faulting.
+	let ok = unsafe { GetMonitorInfoW(hmonitor, std::ptr::from_mut(&mut info).cast::<MONITORINFO>()) };
 	if ok == 0 {
 		return None;
 	}
 	let bounds = MonitorBounds {
-		monitor: rect_tuple(info.rcMonitor),
-		work_area: rect_tuple(info.rcWork),
-		is_primary: info.dwFlags & windows_sys::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY != 0,
+		monitor: rect_tuple(info.monitorInfo.rcMonitor),
+		work_area: rect_tuple(info.monitorInfo.rcWork),
+		is_primary: info.monitorInfo.dwFlags & windows_sys::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY != 0,
 	};
-	(bounds.width() > 0 && bounds.height() > 0).then_some(bounds)
+	if bounds.width() == 0 || bounds.height() == 0 {
+		return None;
+	}
+	let name = decode_wide(&info.szDevice);
+	let name = name.trim();
+	Some(MonitorInfo {
+		bounds,
+		device_name: (!name.is_empty()).then(|| name.to_owned()),
+	})
+}
+
+/// Queries the physical bounds of `monitor`; `None` when the monitor is no longer attached.
+pub fn monitor_bounds(monitor: &MonitorHandle) -> Option<MonitorBounds> {
+	monitor_info(monitor).map(|info| info.bounds)
 }
 
 /// Places `window` borderless fullscreen over `monitor` with DPI-aware geometry.
@@ -86,9 +126,11 @@ pub fn configure_output_window(
 	monitor: &MonitorHandle,
 	elevate: bool,
 ) -> Result<OutputPlacement, PlatformError> {
-	let bounds = monitor_bounds(monitor).ok_or_else(|| {
-		PlatformError::MonitorUnavailable(monitor.name().unwrap_or_else(|| "unnamed display".to_owned()))
-	})?;
+	// Bounds first: `monitor.name()` would panic on a stale handle, and the scale factor
+	// is only meaningful for a monitor that is still attached.
+	let bounds = monitor_bounds(monitor)
+		.ok_or_else(|| PlatformError::MonitorUnavailable(DISCONNECTED_DISPLAY_NAME.to_owned()))?;
+	let scale_factor = sanitize_scale_factor(monitor.scale_factor());
 
 	window.set_decorations(false);
 	window.set_window_level(if elevate {
@@ -104,7 +146,7 @@ pub fn configure_output_window(
 		y: top,
 		width: bounds.width(),
 		height: bounds.height(),
-		scale_factor: sanitize_scale_factor(monitor.scale_factor()),
+		scale_factor,
 		elevated: elevate,
 	};
 	tracing::debug!(

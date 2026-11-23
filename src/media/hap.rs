@@ -185,8 +185,11 @@ pub fn decode_hap_payload(
 ) -> Result<PixelPayload, MediaError> {
 	let expected = expected_hap_bytes(kind, width, height)?;
 	let expected_format = format_nibble(kind).ok_or_else(|| decode_error(frame_index, "not a HAP clip kind"))?;
-	let (header, body, _trailing) =
+	let (header, body, trailing) =
 		split_section(data).ok_or_else(|| decode_error(frame_index, "truncated HAP section header"))?;
+	if !trailing.is_empty() {
+		return Err(decode_error(frame_index, "unexpected trailing data after HAP section"));
+	}
 
 	if header.section_type == SECTION_MULTIPLE_IMAGES {
 		return Err(MediaError::UnsupportedFormat(
@@ -582,6 +585,19 @@ mod tests {
 			Err(MediaError::UnsupportedFormat(_))
 		));
 		assert!(decode_hap_payload(&[], ClipKind::Hap, 8, 8, 0).is_err());
+	}
+
+	#[test]
+	fn rejects_trailing_data_after_the_section() {
+		let raw = fixture_frame_payload(ClipKind::Hap, 8, 8, 0).unwrap();
+		let mut frame = encode_hap_frame(ClipKind::Hap, &raw, FixtureCompression::Snappy, false).unwrap();
+		frame.extend([0xDE, 0xAD, 0xBE, 0xEF]);
+		let error = decode_hap_payload(&frame, ClipKind::Hap, 8, 8, 2).unwrap_err();
+		assert!(matches!(error, MediaError::Decode { frame_index: 2, .. }));
+
+		// A clean frame still decodes.
+		let clean = encode_hap_frame(ClipKind::Hap, &raw, FixtureCompression::Snappy, false).unwrap();
+		assert!(decode_hap_payload(&clean, ClipKind::Hap, 8, 8, 0).is_ok());
 	}
 
 	#[test]

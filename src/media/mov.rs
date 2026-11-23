@@ -607,6 +607,11 @@ fn parse_stsc(stsc: &[u8]) -> ParseResult<Vec<StscEntry>> {
 		}
 		previous = entry.first_chunk;
 	}
+	// `first_chunk` is 1-based in ISO BMFF: a gap before the first chunk would
+	// shift the whole sample-to-chunk mapping, so treat it as corruption.
+	if entries.first().is_some_and(|entry| entry.first_chunk != 1) {
+		return corrupt("first stsc entry must start at chunk 1");
+	}
 	Ok(entries)
 }
 
@@ -667,6 +672,11 @@ fn build_samples(
 }
 
 /// Computes frames per second from the media timescale and `stts` durations.
+///
+/// Results outside [`MIN_CLIP_FPS`](crate::model::layer::MIN_CLIP_FPS) `..=`
+/// [`MAX_CLIP_FPS`](crate::model::layer::MAX_CLIP_FPS) are replaced with
+/// [`FALLBACK_FPS`], so a corrupt timescale cannot produce a playhead that jumps
+/// through the clip every frame.
 fn compute_fps(timescale: u32, stts: &[u8]) -> ParseResult<f32> {
 	let count = table_entries(stts, 8, 8, read_u32(stts, 4)?, "stts")?;
 	let table = stts
@@ -685,7 +695,11 @@ fn compute_fps(timescale: u32, stts: &[u8]) -> ParseResult<f32> {
 	}
 	let average = total_duration as f64 / total_samples as f64;
 	let fps = f64::from(timescale) / average;
-	if fps.is_finite() && fps > 0.0 && fps <= 1000.0 {
+	let (min, max) = (
+		f64::from(crate::model::layer::MIN_CLIP_FPS),
+		f64::from(crate::model::layer::MAX_CLIP_FPS),
+	);
+	if fps.is_finite() && (min..=max).contains(&fps) {
 		Ok(fps as f32)
 	} else {
 		Ok(FALLBACK_FPS)
@@ -876,6 +890,44 @@ mod tests {
 		let mut fixture = HapMovFixture::new(ClipKind::Hap, 8, 8, 2);
 		fixture.timescale = 0;
 		assert_eq!(parse(&fixture).unwrap().fps, FALLBACK_FPS);
+	}
+
+	#[test]
+	fn fps_outside_the_clip_bounds_falls_back() {
+		// timescale 1 with 100_000-unit frames means 1e-5 fps, far below the floor.
+		let mut slow = HapMovFixture::new(ClipKind::Hap, 8, 8, 2);
+		slow.timescale = 1;
+		slow.sample_duration = 100_000;
+		assert_eq!(parse(&slow).unwrap().fps, FALLBACK_FPS);
+
+		// A huge timescale produces 10_000 fps, far above the ceiling.
+		let mut fast = HapMovFixture::new(ClipKind::Hap, 8, 8, 2);
+		fast.timescale = 10_000_000;
+		fast.sample_duration = 1_000;
+		assert_eq!(parse(&fast).unwrap().fps, FALLBACK_FPS);
+	}
+
+	#[test]
+	fn missing_stts_falls_back_to_the_default_fps() {
+		let mut fixture = HapMovFixture::new(ClipKind::Hap, 16, 16, 4);
+		fixture.omit_stts = true;
+		let index = parse(&fixture).unwrap();
+		assert_eq!(index.fps, FALLBACK_FPS);
+		assert_eq!(index.frame_count(), 4);
+	}
+
+	#[test]
+	fn rejects_stsc_that_does_not_start_at_chunk_one() {
+		let mut fixture = HapMovFixture::new(ClipKind::Hap, 8, 8, 3);
+		fixture.stsc_first_chunk = Some(2);
+		assert!(matches!(parse(&fixture), Err(MediaError::Corrupt { .. })));
+	}
+
+	#[test]
+	fn rejects_oversized_sample_sizes() {
+		let mut fixture = HapMovFixture::new(ClipKind::Hap, 8, 8, 3);
+		fixture.sample_size_override = Some(300 * 1024 * 1024);
+		assert!(matches!(parse(&fixture), Err(MediaError::Corrupt { .. })));
 	}
 
 	#[test]

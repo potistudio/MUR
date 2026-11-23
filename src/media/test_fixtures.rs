@@ -292,6 +292,12 @@ pub struct HapMovFixture {
 	pub declared_size_override: Option<(u32, u32)>,
 	/// Value added to every video chunk offset (to fake out-of-bounds tables).
 	pub chunk_offset_bias: u64,
+	/// Override the `first_chunk` value of the first `stsc` entry (default `1`).
+	pub stsc_first_chunk: Option<u32>,
+	/// Leave the `stts` box out of the video sample table entirely.
+	pub omit_stts: bool,
+	/// Override every `stsz` sample size with this value.
+	pub sample_size_override: Option<u32>,
 }
 
 impl HapMovFixture {
@@ -317,6 +323,9 @@ impl HapMovFixture {
 			codec_override: None,
 			declared_size_override: None,
 			chunk_offset_bias: 0,
+			stsc_first_chunk: None,
+			omit_stts: false,
+			sample_size_override: None,
 		}
 	}
 
@@ -527,15 +536,15 @@ fn stsz(sizes: &[u32]) -> Result<Vec<u8>, MediaError> {
 	Ok(full_box(b"stsz", 0, 0, &body))
 }
 
-fn stsc(sample_count: u32, samples_per_chunk: u32) -> (Vec<u8>, u32) {
+fn stsc(sample_count: u32, samples_per_chunk: u32, first_chunk: u32) -> (Vec<u8>, u32) {
 	let per_chunk = samples_per_chunk.max(1);
 	let chunk_count = sample_count.div_ceil(per_chunk);
 	let remainder = sample_count % per_chunk;
 	let mut entries: Vec<(u32, u32)> = Vec::new();
 	if chunk_count == 1 {
-		entries.push((1, sample_count));
+		entries.push((first_chunk, sample_count));
 	} else if chunk_count > 1 {
-		entries.push((1, per_chunk));
+		entries.push((first_chunk, per_chunk));
 		if remainder != 0 {
 			entries.push((chunk_count, remainder));
 		}
@@ -568,10 +577,13 @@ fn chunk_offset_box(offsets: &[u64], use_co64: bool) -> Result<Vec<u8>, MediaErr
 fn video_trak(fixture: &HapMovFixture, frames: &[Vec<u8>], payload_start: u64) -> Result<Vec<u8>, MediaError> {
 	let sizes = frames
 		.iter()
-		.map(|frame| len_u32(frame.len()))
+		.map(|frame| match fixture.sample_size_override {
+			Some(size) => Ok(size),
+			None => len_u32(frame.len()),
+		})
 		.collect::<Result<Vec<u32>, MediaError>>()?;
 	let count = len_u32(sizes.len())?;
-	let (stsc_box, chunk_count) = stsc(count, fixture.samples_per_chunk);
+	let (stsc_box, chunk_count) = stsc(count, fixture.samples_per_chunk, fixture.stsc_first_chunk.unwrap_or(1));
 	let per_chunk = usize::try_from(fixture.samples_per_chunk.max(1)).unwrap_or(1);
 	let mut offsets = Vec::new();
 	let mut running = payload_start;
@@ -608,16 +620,18 @@ fn video_trak(fixture: &HapMovFixture, frames: &[Vec<u8>], payload_start: u64) -
 	entry.extend(24u16.to_be_bytes());
 	entry.extend(0xFFFFu16.to_be_bytes());
 
-	let stbl = mov_box(
-		b"stbl",
-		&concat(&[
-			stsd(&fixture.fourcc(), &entry),
-			stts(count, fixture.sample_duration),
-			stsc_box,
-			stsz(&sizes)?,
-			chunk_offset_box(&offsets, fixture.use_co64)?,
-		]),
-	);
+	let mut stbl_parts = vec![
+		stsd(&fixture.fourcc(), &entry),
+		stsc_box,
+		stsz(&sizes)?,
+		chunk_offset_box(&offsets, fixture.use_co64)?,
+	];
+	if !fixture.omit_stts {
+		// `stts` precedes `stsc` in the canonical layout; order is irrelevant to
+		// the parser, but keep the table together for readability.
+		stbl_parts.insert(1, stts(count, fixture.sample_duration));
+	}
+	let stbl = mov_box(b"stbl", &concat(&stbl_parts));
 	let vmhd = full_box(b"vmhd", 0, 1, &[0u8; 8]);
 	let minf = mov_box(b"minf", &concat(&[vmhd, hdlr(b"alis"), dinf(), stbl]));
 	let duration = u64::from(count).saturating_mul(u64::from(fixture.sample_duration));
@@ -642,7 +656,7 @@ fn audio_trak(fixture: &HapMovFixture, offset: u64) -> Result<Vec<u8>, MediaErro
 		&concat(&[
 			stsd(b"sowt", &entry),
 			stts(1, 4),
-			stsc(1, 1).0,
+			stsc(1, 1, 1).0,
 			stsz(&[len_u32(AUDIO_SAMPLE.len())?])?,
 			chunk_offset_box(&[offset], fixture.use_co64)?,
 		]),

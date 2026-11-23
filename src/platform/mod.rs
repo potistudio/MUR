@@ -3,7 +3,7 @@
 //! The cross-platform part of this module turns winit [`MonitorHandle`]s into stable
 //! [`MonitorSummary`] values, matches the operator's saved display choice against the
 //! currently connected monitors, and exposes small facades that dispatch to the
-//! [`macos`] and [`windows`] back ends:
+//! `macos` and `windows` back ends:
 //!
 //! - [`configure_output_window`] places the output window borderless over a whole
 //!   monitor (above the macOS menu bar / Dock, DPI-aware on Windows).
@@ -11,6 +11,13 @@
 //!   item on macOS into a request that the control UI confirms, instead of terminating
 //!   the process immediately. On Windows `Alt+F4` and the close button already arrive as
 //!   `WindowEvent::CloseRequested`, so nothing needs intercepting there.
+//! - [`prevent_app_nap`] keeps macOS App Nap from throttling the render loop.
+//!
+//! Monitor handles are only queried through crash-safe paths: on Windows winit's
+//! `MonitorHandle::name` / `size` panic for a display that was just unplugged, so the
+//! Windows back end reads `GetMonitorInfoW` itself and disconnected monitors are skipped
+//! before anything else touches them. [`MonitorDescriptor`] caches the geometry, so
+//! callers never have to query a possibly stale handle again.
 
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -69,6 +76,12 @@ impl SummarizedMonitor for MonitorSummary {
 	}
 }
 
+/// Display name reported for a monitor that vanished while it was being queried.
+pub const DISCONNECTED_DISPLAY_NAME: &str = "unnamed or disconnected display";
+
+/// Separator plus prefix of the native display id component of a [`monitor_id`].
+const NATIVE_ID_PREFIX: &str = "cg:";
+
 /// A connected monitor: the live winit handle paired with its extracted summary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MonitorDescriptor {
@@ -76,19 +89,122 @@ pub struct MonitorDescriptor {
 	pub handle: MonitorHandle,
 	/// Serializable description shown in the control UI.
 	pub summary: MonitorSummary,
+	/// Top-left corner in physical desktop pixels, captured with [`MonitorDescriptor::summary`].
+	///
+	/// Use this (and `summary.width` / `summary.height`) instead of querying
+	/// [`MonitorDescriptor::handle`], which may already be stale.
+	pub position: (i32, i32),
 }
 
 impl MonitorDescriptor {
-	/// Builds a descriptor for `handle`, flagging it primary when it equals `primary`.
-	pub fn new(handle: MonitorHandle, primary: Option<&MonitorHandle>) -> Self {
-		let summary = monitor_summary(&handle, primary);
-		Self { handle, summary }
+	/// Builds a descriptor for `handle`, or `None` when the monitor is no longer connected.
+	///
+	/// `primary` is only consulted on platforms where the back end cannot tell the primary
+	/// display itself (neither macOS nor Windows).
+	pub fn probe(handle: MonitorHandle, primary: Option<&MonitorHandle>) -> Option<Self> {
+		let probe = probe_monitor(&handle)?;
+		let is_primary = probe
+			.is_primary
+			.unwrap_or_else(|| primary.is_some_and(|primary| primary == &handle));
+		let summary = probe.summary(is_primary);
+		Some(Self {
+			handle,
+			summary,
+			position: (probe.position.x, probe.position.y),
+		})
+	}
+
+	/// Top-left corner in physical desktop pixels.
+	pub fn position(&self) -> (i32, i32) {
+		self.position
 	}
 }
 
 impl SummarizedMonitor for MonitorDescriptor {
 	fn summary(&self) -> &MonitorSummary {
 		&self.summary
+	}
+}
+
+/// Raw facts about a connected monitor gathered through crash-safe platform calls.
+#[derive(Debug, Clone, PartialEq)]
+struct MonitorProbe {
+	/// OS display name, if any.
+	name: Option<String>,
+	/// Size in physical pixels.
+	size: PhysicalSize<u32>,
+	/// Top-left corner in physical desktop pixels.
+	position: PhysicalPosition<i32>,
+	/// HiDPI scale factor (already sanitized).
+	scale_factor: f64,
+	/// Primary flag when the back end knows it.
+	is_primary: Option<bool>,
+	/// Stable native display id (`CGDirectDisplayID` on macOS).
+	native_id: Option<u32>,
+}
+
+impl MonitorProbe {
+	fn summary(&self, is_primary: bool) -> MonitorSummary {
+		let name = self.name.as_deref();
+		MonitorSummary {
+			id: monitor_id_with_native(name, self.size, self.position, self.native_id),
+			name: monitor_display_name(name, self.size),
+			width: self.size.width,
+			height: self.size.height,
+			scale_factor: self.scale_factor,
+			is_primary,
+		}
+	}
+}
+
+/// Queries `handle` without ever touching winit calls that panic on stale handles.
+///
+/// Returns `None` when the monitor is known to be disconnected.
+fn probe_monitor(handle: &MonitorHandle) -> Option<MonitorProbe> {
+	#[cfg(target_os = "windows")]
+	{
+		// Bounds first: they double as the "still connected" check, and winit's own
+		// `name()` / `size()` would unwrap a failed `GetMonitorInfoW`.
+		let info = windows::monitor_info(handle)?;
+		let (left, top, _, _) = info.bounds.monitor;
+		Some(MonitorProbe {
+			name: info.device_name,
+			size: PhysicalSize::new(info.bounds.width(), info.bounds.height()),
+			position: PhysicalPosition::new(left, top),
+			scale_factor: sanitize_scale_factor(handle.scale_factor()),
+			is_primary: Some(info.bounds.is_primary),
+			native_id: None,
+		})
+	}
+	#[cfg(target_os = "macos")]
+	{
+		use winit::platform::macos::MonitorHandleExtMacOS;
+		let position = handle.position();
+		let screen = macos::screen_info(handle);
+		let name = screen
+			.as_ref()
+			.and_then(|screen| screen.localized_name.clone())
+			.or_else(|| handle.name());
+		let is_primary = screen.map_or(position == PhysicalPosition::new(0, 0), |screen| screen.is_primary);
+		Some(MonitorProbe {
+			name,
+			size: handle.size(),
+			position,
+			scale_factor: sanitize_scale_factor(handle.scale_factor()),
+			is_primary: Some(is_primary),
+			native_id: Some(handle.native_id()),
+		})
+	}
+	#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+	{
+		Some(MonitorProbe {
+			name: handle.name(),
+			size: handle.size(),
+			position: handle.position(),
+			scale_factor: sanitize_scale_factor(handle.scale_factor()),
+			is_primary: None,
+			native_id: None,
+		})
 	}
 }
 
@@ -120,38 +236,84 @@ pub fn monitor_display_name(name: Option<&str>, size: PhysicalSize<u32>) -> Stri
 /// [`find_matching_monitor`] additionally falls back to the name so that a resolution
 /// change or rearrangement still finds the operator's display.
 pub fn monitor_id(name: Option<&str>, size: PhysicalSize<u32>, position: PhysicalPosition<i32>) -> String {
-	format!(
+	monitor_id_with_native(name, size, position, None)
+}
+
+/// Builds a monitor identifier that also carries a stable native display id.
+///
+/// With `native_id = Some(id)` (the `CGDirectDisplayID` on macOS) the identifier is
+/// `name|WxH|x,y|cg:<id>`, so the same physical display is still recognized after a
+/// resolution change or rearrangement, and two displays of the same model never collide.
+/// Without it this is exactly [`monitor_id`].
+pub fn monitor_id_with_native(
+	name: Option<&str>,
+	size: PhysicalSize<u32>,
+	position: PhysicalPosition<i32>,
+	native_id: Option<u32>,
+) -> String {
+	let mut id = format!(
 		"{}|{}x{}|{},{}",
 		monitor_display_name(name, size),
 		size.width,
 		size.height,
 		position.x,
 		position.y
-	)
+	);
+	if let Some(native_id) = native_id {
+		id.push('|');
+		id.push_str(NATIVE_ID_PREFIX);
+		id.push_str(&native_id.to_string());
+	}
+	id
 }
 
 /// Extracts the [`MonitorSummary`] of `handle`; `primary` is the OS primary monitor, if known.
+///
+/// Uses the same crash-safe queries as [`collect_monitors`]. A monitor that disconnected
+/// in the meantime is summarized as [`DISCONNECTED_DISPLAY_NAME`] with a zero size.
 pub fn monitor_summary(handle: &MonitorHandle, primary: Option<&MonitorHandle>) -> MonitorSummary {
-	let os_name = handle.name();
-	let size = handle.size();
-	let position = handle.position();
-	MonitorSummary {
-		id: monitor_id(os_name.as_deref(), size, position),
-		name: monitor_display_name(os_name.as_deref(), size),
-		width: size.width,
-		height: size.height,
-		scale_factor: sanitize_scale_factor(handle.scale_factor()),
-		is_primary: primary.is_some_and(|primary| primary == handle),
+	match MonitorDescriptor::probe(handle.clone(), primary) {
+		Some(descriptor) => descriptor.summary,
+		None => {
+			let size = PhysicalSize::new(0, 0);
+			MonitorSummary {
+				id: monitor_id(Some(DISCONNECTED_DISPLAY_NAME), size, PhysicalPosition::new(0, 0)),
+				name: DISCONNECTED_DISPLAY_NAME.to_owned(),
+				width: 0,
+				height: 0,
+				scale_factor: 1.0,
+				is_primary: false,
+			}
+		}
 	}
 }
 
 /// Enumerates every connected monitor with its summary, in OS order.
+///
+/// Monitors that disconnect during enumeration are skipped. On macOS and Windows the
+/// primary display is determined by the back end; `ActiveEventLoop::primary_monitor` is
+/// only used elsewhere (it panics inside winit on macOS when the main display vanishes).
 pub fn collect_monitors(event_loop: &ActiveEventLoop) -> Vec<MonitorDescriptor> {
+	#[cfg(any(target_os = "macos", target_os = "windows"))]
+	let primary: Option<MonitorHandle> = None;
+	#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 	let primary = event_loop.primary_monitor();
 	event_loop
 		.available_monitors()
-		.map(|handle| MonitorDescriptor::new(handle, primary.as_ref()))
+		.filter_map(|handle| MonitorDescriptor::probe(handle, primary.as_ref()))
 		.collect()
+}
+
+/// Returns the descriptor in `monitors` whose live handle equals `handle`.
+///
+/// Used to identify the monitor of a window (`Window::current_monitor`) without querying
+/// the handle itself, which may be stale.
+pub fn find_monitor_by_handle<'a>(
+	monitors: &'a [MonitorDescriptor],
+	handle: Option<&MonitorHandle>,
+) -> Option<&'a MonitorDescriptor> {
+	let handle = handle?;
+	monitors.iter().find(|monitor| &monitor.handle == handle)
 }
 
 /// Clones the summaries out of `monitors`, e.g. for `AppState::available_monitors`.
@@ -161,37 +323,73 @@ pub fn summaries<T: SummarizedMonitor>(monitors: &[T]) -> Vec<MonitorSummary> {
 
 /// Finds the monitor the operator selected.
 ///
-/// `selected` may be either a [`MonitorSummary::id`] or a [`MonitorSummary::name`]. The
-/// lookup tries, in order: exact id, exact name, then case-insensitive name. A stale id
-/// (the monitor's resolution or arrangement changed) finally matches by its name part,
-/// preferring the monitor at the same desktop position. `None` is returned when nothing
-/// is selected or the selected display is disconnected, so the caller can enter
-/// `WaitingForMonitor` and resume once the display reappears.
+/// Same as [`find_matching_monitor_excluding`] without an excluded monitor.
 pub fn find_matching_monitor<'a, T: SummarizedMonitor>(monitors: &'a [T], selected: Option<&str>) -> Option<&'a T> {
+	find_matching_monitor_excluding(monitors, selected, None)
+}
+
+/// Finds the monitor the operator selected, never falling back onto `exclude_id`.
+///
+/// `selected` may be either a [`MonitorSummary::id`] or a [`MonitorSummary::name`]. The
+/// lookup tries, in order:
+///
+/// 1. exact id — an intentional choice, honored even for the excluded monitor;
+/// 2. the same native display id (see [`monitor_id_with_native`]) with a matching name,
+///    i.e. the very same physical display after a resolution change or rearrangement;
+/// 3. exact name, then case-insensitive name;
+/// 4. for a stale id, its name part, preferring the monitor at the same desktop position.
+///
+/// Steps 3 and 4 skip the monitor whose id equals `exclude_id` (the control window's
+/// display): when an external display that shares its model name with the control
+/// display is unplugged, the output must wait for it instead of covering the control UI.
+/// `None` is returned when nothing is selected or the selected display is disconnected,
+/// so the caller can enter `WaitingForMonitor` and resume once the display reappears.
+pub fn find_matching_monitor_excluding<'a, T: SummarizedMonitor>(
+	monitors: &'a [T],
+	selected: Option<&str>,
+	exclude_id: Option<&str>,
+) -> Option<&'a T> {
 	let selected = selected.map(str::trim).filter(|selected| !selected.is_empty())?;
 	if let Some(found) = monitors.iter().find(|monitor| monitor.summary().id == selected) {
 		return Some(found);
 	}
-	if let Some(found) = find_by_name(monitors, selected) {
+	let parsed = parse_monitor_id(selected);
+	if let Some(parsed) = parsed.as_ref()
+		&& let Some(native) = parsed.native
+		&& let Some(found) = monitors.iter().find(|monitor| {
+			let summary = monitor.summary();
+			names_match(&summary.name, parsed.name)
+				&& parse_monitor_id(&summary.id).is_some_and(|candidate| candidate.native == Some(native))
+		}) {
 		return Some(found);
 	}
-	let (rest, position) = selected.rsplit_once('|')?;
-	let (name, _size) = rest.rsplit_once('|')?;
-	monitors
+
+	let candidates: Vec<&'a T> = monitors
 		.iter()
-		.filter(|monitor| names_match(&monitor.summary().name, name))
-		.find(|monitor| monitor_id_position(&monitor.summary().id) == Some(position))
-		.or_else(|| find_by_name(monitors, name))
+		.filter(|monitor| exclude_id.is_none_or(|exclude| monitor.summary().id != exclude))
+		.collect();
+	if let Some(found) = find_by_name(&candidates, selected) {
+		return Some(found);
+	}
+	let parsed = parsed?;
+	candidates
+		.iter()
+		.copied()
+		.filter(|monitor| names_match(&monitor.summary().name, parsed.name))
+		.find(|monitor| parse_monitor_id(&monitor.summary().id).is_some_and(|id| id.position == parsed.position))
+		.or_else(|| find_by_name(&candidates, parsed.name))
 }
 
 /// Finds a monitor by exact name, then by case-insensitive name.
-fn find_by_name<'a, T: SummarizedMonitor>(monitors: &'a [T], name: &str) -> Option<&'a T> {
+fn find_by_name<'a, T: SummarizedMonitor>(monitors: &[&'a T], name: &str) -> Option<&'a T> {
 	monitors
 		.iter()
+		.copied()
 		.find(|monitor| monitor.summary().name == name)
 		.or_else(|| {
 			monitors
 				.iter()
+				.copied()
 				.find(|monitor| names_match(&monitor.summary().name, name))
 		})
 }
@@ -201,9 +399,29 @@ fn names_match(left: &str, right: &str) -> bool {
 	left.trim().to_lowercase() == right.trim().to_lowercase()
 }
 
-/// Returns the trailing `x,y` position component of a [`monitor_id`].
-fn monitor_id_position(id: &str) -> Option<&str> {
-	id.rsplit_once('|').map(|(_, position)| position)
+/// Components of a [`monitor_id`] / [`monitor_id_with_native`] string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedMonitorId<'a> {
+	/// Display name part.
+	name: &'a str,
+	/// `x,y` position part.
+	position: &'a str,
+	/// Native display id digits, when present.
+	native: Option<&'a str>,
+}
+
+/// Splits a monitor id into its parts; `None` for plain names.
+fn parse_monitor_id(id: &str) -> Option<ParsedMonitorId<'_>> {
+	let (rest, native) = match id.rsplit_once('|') {
+		Some((rest, last)) => match last.strip_prefix(NATIVE_ID_PREFIX) {
+			Some(native) => (rest, Some(native)),
+			None => (id, None),
+		},
+		None => (id, None),
+	};
+	let (rest, position) = rest.rsplit_once('|')?;
+	let (name, _size) = rest.rsplit_once('|')?;
+	Some(ParsedMonitorId { name, position, native })
 }
 
 /// Picks the first non-primary display, used to auto-select an external output on first launch.
@@ -436,6 +654,39 @@ pub fn install_exit_guard() -> Result<ExitGuardStatus, PlatformError> {
 	}
 }
 
+/// Keeps macOS App Nap from throttling MUR while it is alive.
+///
+/// App Nap coalesces timers and slows the run loop of apps whose windows are hidden or
+/// occluded, which would starve the output window's 60 fps tick when the control window
+/// is in the background. On other platforms this is an empty value.
+#[must_use = "App Nap is only prevented while the guard is alive"]
+pub struct AppNapGuard {
+	#[cfg(target_os = "macos")]
+	_activity: macos::AppNapActivity,
+}
+
+impl std::fmt::Debug for AppNapGuard {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter.debug_struct("AppNapGuard").finish_non_exhaustive()
+	}
+}
+
+/// Begins a latency-critical activity that disables App Nap until the guard is dropped.
+///
+/// A no-op on platforms without App Nap.
+pub fn prevent_app_nap() -> AppNapGuard {
+	#[cfg(target_os = "macos")]
+	{
+		AppNapGuard {
+			_activity: macos::AppNapActivity::begin(),
+		}
+	}
+	#[cfg(not(target_os = "macos"))]
+	{
+		AppNapGuard {}
+	}
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
@@ -513,6 +764,103 @@ mod tests {
 		assert!(find_matching_monitor(&monitors, None).is_none());
 		assert!(find_matching_monitor(&monitors, Some("  ")).is_none());
 		assert!(find_matching_monitor::<MonitorSummary>(&[], Some("DELL U2720Q")).is_none());
+	}
+
+	#[test]
+	fn native_id_is_appended_and_parsed() {
+		let size = PhysicalSize::new(3024, 1964);
+		let id = monitor_id_with_native(
+			Some("Built-in Retina Display"),
+			size,
+			PhysicalPosition::new(0, 0),
+			Some(1),
+		);
+		assert_eq!(id, "Built-in Retina Display|3024x1964|0,0|cg:1");
+		let parsed = parse_monitor_id(&id).unwrap();
+		assert_eq!(parsed.name, "Built-in Retina Display");
+		assert_eq!(parsed.position, "0,0");
+		assert_eq!(parsed.native, Some("1"));
+		let plain = parse_monitor_id("DELL|1920x1080|-1920,0").unwrap();
+		assert_eq!(plain.native, None);
+		assert_eq!(plain.position, "-1920,0");
+		assert!(parse_monitor_id("DELL").is_none());
+	}
+
+	#[test]
+	fn native_id_survives_resolution_change() {
+		let monitors = vec![
+			summary("Built-in|1512x982|0,0|cg:1", "Built-in", true),
+			summary("LG HDR 4K|1920x1080|1512,0|cg:7", "LG HDR 4K", false),
+		];
+		let found = find_matching_monitor(&monitors, Some("LG HDR 4K|3840x2160|-3840,0|cg:7")).unwrap();
+		assert_eq!(found.id, "LG HDR 4K|1920x1080|1512,0|cg:7");
+	}
+
+	fn same_named() -> Vec<MonitorSummary> {
+		vec![
+			summary("Monitor #1234|1920x1080|0,0|cg:1", "Monitor #1234", true),
+			summary("Monitor #1234|1920x1080|1920,0|cg:2", "Monitor #1234", false),
+		]
+	}
+
+	#[test]
+	fn same_named_external_is_found_and_control_is_never_a_fallback() {
+		let control = "Monitor #1234|1920x1080|0,0|cg:1";
+		let external = "Monitor #1234|1920x1080|1920,0|cg:2";
+		let monitors = same_named();
+
+		let by_id = find_matching_monitor_excluding(&monitors, Some(external), Some(control)).unwrap();
+		assert_eq!(by_id.id, external);
+		// A plain name shared by both displays resolves to the non-control one.
+		let by_name = find_matching_monitor_excluding(&monitors, Some("Monitor #1234"), Some(control)).unwrap();
+		assert_eq!(by_name.id, external);
+
+		// Unplug the external display: only the control display remains.
+		let unplugged: Vec<MonitorSummary> = monitors.into_iter().filter(|monitor| monitor.id == control).collect();
+		assert!(find_matching_monitor_excluding(&unplugged, Some(external), Some(control)).is_none());
+		assert!(find_matching_monitor_excluding(&unplugged, Some("Monitor #1234"), Some(control)).is_none());
+		assert!(
+			find_matching_monitor_excluding(&unplugged, Some("monitor #1234|3840x2160|1920,0"), Some(control))
+				.is_none()
+		);
+		// Without exclusion the legacy lookup would have hijacked the control display.
+		assert_eq!(find_matching_monitor(&unplugged, Some(external)).unwrap().id, control);
+	}
+
+	#[test]
+	fn explicitly_selected_control_display_is_honored() {
+		let control = "Monitor #1234|1920x1080|0,0|cg:1";
+		let single: Vec<MonitorSummary> = same_named()
+			.into_iter()
+			.filter(|monitor| monitor.id == control)
+			.collect();
+		let found = find_matching_monitor_excluding(&single, Some(control), Some(control)).unwrap();
+		assert_eq!(found.id, control);
+		// The same physical display after a resolution change is still the operator's choice.
+		let moved = find_matching_monitor_excluding(&single, Some("Monitor #1234|3840x2160|0,0|cg:1"), Some(control));
+		assert_eq!(moved.unwrap().id, control);
+	}
+
+	#[test]
+	fn exclusion_without_native_ids_keeps_fallbacks_off_the_control_display() {
+		let monitors = vec![
+			summary("DELL|1920x1080|0,0", "DELL", true),
+			summary("DELL|1920x1080|1920,0", "DELL", false),
+		];
+		let found = find_matching_monitor_excluding(&monitors, Some("DELL|2560x1440|0,0"), Some("DELL|1920x1080|0,0"));
+		assert_eq!(found.unwrap().id, "DELL|1920x1080|1920,0");
+		let only_control = vec![summary("DELL|1920x1080|0,0", "DELL", true)];
+		assert!(
+			find_matching_monitor_excluding(&only_control, Some("DELL|1920x1080|1920,0"), Some("DELL|1920x1080|0,0"))
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn app_nap_guard_can_be_created_and_dropped() {
+		let guard = prevent_app_nap();
+		assert!(format!("{guard:?}").contains("AppNapGuard"));
+		drop(guard);
 	}
 
 	#[test]

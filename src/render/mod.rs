@@ -164,11 +164,29 @@ impl GpuContext {
 	}
 
 	/// Configures `surface` for `width`x`height` with a non-sRGB format and vsync.
+	///
+	/// Equivalent to [`GpuContext::configure_surface_with_vsync`] with `prefer_vsync = true`.
 	pub fn configure_surface(
 		&self,
 		surface: &wgpu::Surface<'_>,
 		width: u32,
 		height: u32,
+	) -> Result<wgpu::SurfaceConfiguration, RenderError> {
+		self.configure_surface_with_vsync(surface, width, height, true)
+	}
+
+	/// Configures `surface` for `width`x`height` with a non-sRGB format.
+	///
+	/// `prefer_vsync = true` keeps presentation locked to the display refresh (used for
+	/// the audience output). `prefer_vsync = false` picks a non-blocking present mode when
+	/// the surface offers one (used for the control window), so a slow control display
+	/// can never throttle the output; see [`select_present_mode`].
+	pub fn configure_surface_with_vsync(
+		&self,
+		surface: &wgpu::Surface<'_>,
+		width: u32,
+		height: u32,
+		prefer_vsync: bool,
 	) -> Result<wgpu::SurfaceConfiguration, RenderError> {
 		if width == 0 || height == 0 {
 			return Err(RenderError::InvalidTarget(format!(
@@ -179,11 +197,7 @@ impl GpuContext {
 		let format = select_surface_format(&caps.formats).ok_or_else(|| {
 			RenderError::SurfaceLost("surface is incompatible with the selected GPU adapter".to_owned())
 		})?;
-		let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Fifo) {
-			wgpu::PresentMode::Fifo
-		} else {
-			wgpu::PresentMode::AutoVsync
-		};
+		let present_mode = select_present_mode(&caps.present_modes, prefer_vsync);
 		let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
 			wgpu::CompositeAlphaMode::Opaque
 		} else {
@@ -213,6 +227,36 @@ impl GpuContext {
 		}
 		Ok(config)
 	}
+}
+
+/// Present modes tried, in order, when vsync is preferred.
+const VSYNC_PRESENT_MODES: [wgpu::PresentMode; 2] = [wgpu::PresentMode::Fifo, wgpu::PresentMode::AutoVsync];
+
+/// Present modes tried, in order, when vsync is not required.
+const NO_VSYNC_PRESENT_MODES: [wgpu::PresentMode; 5] = [
+	wgpu::PresentMode::Mailbox,
+	wgpu::PresentMode::Immediate,
+	wgpu::PresentMode::FifoRelaxed,
+	wgpu::PresentMode::AutoNoVsync,
+	wgpu::PresentMode::Fifo,
+];
+
+/// Picks the present mode for a surface supporting `available` modes.
+///
+/// With `prefer_vsync` the first supported of `Fifo`, `AutoVsync` is used; otherwise the
+/// first supported of `Mailbox`, `Immediate`, `FifoRelaxed`, `AutoNoVsync`, `Fifo`. The
+/// `Auto*` modes are always accepted by wgpu, so they act as the final fallback.
+pub fn select_present_mode(available: &[wgpu::PresentMode], prefer_vsync: bool) -> wgpu::PresentMode {
+	let (preferred, fallback): (&[wgpu::PresentMode], wgpu::PresentMode) = if prefer_vsync {
+		(&VSYNC_PRESENT_MODES, wgpu::PresentMode::AutoVsync)
+	} else {
+		(&NO_VSYNC_PRESENT_MODES, wgpu::PresentMode::AutoNoVsync)
+	};
+	preferred
+		.iter()
+		.copied()
+		.find(|mode| available.contains(mode))
+		.unwrap_or(fallback)
 }
 
 /// Picks `Bgra8Unorm`, then `Rgba8Unorm`, then any non-sRGB, then any format.
@@ -707,6 +751,20 @@ mod tests {
 				None
 			}
 		}
+	}
+
+	#[test]
+	fn present_mode_prefers_vsync_or_low_latency() {
+		use wgpu::PresentMode::{AutoNoVsync, AutoVsync, Fifo, FifoRelaxed, Immediate, Mailbox};
+		assert_eq!(select_present_mode(&[Immediate, Fifo, Mailbox], true), Fifo);
+		assert_eq!(select_present_mode(&[Immediate, Mailbox], true), AutoVsync);
+		assert_eq!(select_present_mode(&[], true), AutoVsync);
+
+		assert_eq!(select_present_mode(&[Fifo, Immediate, Mailbox], false), Mailbox);
+		assert_eq!(select_present_mode(&[Fifo, Immediate], false), Immediate);
+		assert_eq!(select_present_mode(&[Fifo, FifoRelaxed], false), FifoRelaxed);
+		assert_eq!(select_present_mode(&[Fifo], false), Fifo);
+		assert_eq!(select_present_mode(&[], false), AutoNoVsync);
 	}
 
 	fn solid_rgba(width: u32, height: u32, rgba: [u8; 4]) -> DecodedFrame {

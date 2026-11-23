@@ -28,22 +28,41 @@
 //!
 //! winit's own `ActiveEventLoop::exit()` stops the run loop without `terminate:`, so a
 //! confirmed exit is unaffected by the hook.
+//!
+//! # Display identity
+//!
+//! winit names macOS monitors `"Monitor #<model number>"`, which is identical for two
+//! displays of the same model and unrelated to what System Settings shows. MUR resolves
+//! the `NSScreen` of each monitor through its `CGDirectDisplayID`
+//! (`deviceDescription[@"NSScreenNumber"]`), uses `NSScreen.localizedName` as the display
+//! name, and derives the primary display from the first entry of `NSScreen.screens`
+//! instead of `ActiveEventLoop::primary_monitor`.
+//!
+//! # App Nap
+//!
+//! [`AppNapActivity`] holds an `NSProcessInfo` activity (`UserInitiated | LatencyCritical`)
+//! so macOS never throttles timers or the run loop while the show is running.
 
 use std::cell::OnceCell;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, Imp, NSObject, Sel};
+use objc2::runtime::{AnyClass, AnyObject, Imp, NSObject, ProtocolObject, Sel};
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, ffi, msg_send, sel};
 use objc2_app_kit::{
 	NSApplication, NSApplicationTerminateReply, NSMainMenuWindowLevel, NSMenu, NSNormalWindowLevel, NSScreen, NSView,
 	NSWindow, NSWindowCollectionBehavior,
 };
-use objc2_foundation::{NSObjectProtocol, NSRect, NSUInteger};
+use objc2_foundation::{
+	NSActivityOptions, NSNumber, NSObjectProtocol, NSProcessInfo, NSRect, NSString, NSUInteger, ns_string,
+};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::monitor::MonitorHandle;
+use winit::platform::macos::MonitorHandleExtMacOS;
 use winit::window::Window;
 
-use super::{ExitGuardStatus, LogicalRect, OutputPlacement, PlatformError, sanitize_scale_factor};
+use super::{
+	DISCONNECTED_DISPLAY_NAME, ExitGuardStatus, LogicalRect, OutputPlacement, PlatformError, sanitize_scale_factor,
+};
 
 /// Maximum distance, in points, between a winit monitor rectangle and an `NSScreen` frame.
 const FRAME_MATCH_TOLERANCE: f64 = 2.0;
@@ -87,31 +106,80 @@ fn logical_from_ns(rect: NSRect) -> LogicalRect {
 	}
 }
 
-/// Finds the `NSScreen` frame (AppKit coordinates) that corresponds to `monitor`.
-///
-/// winit reports monitor geometry in top-left-origin CoreGraphics desktop space, so the
-/// monitor rectangle is compared against each screen frame flipped by the primary
-/// screen's height. Returns `None` when no connected screen matches, i.e. the monitor
-/// was unplugged.
-fn screen_frame_for(monitor: &MonitorHandle, mtm: MainThreadMarker) -> Option<NSRect> {
-	let target = LogicalRect::from_physical(monitor.position(), monitor.size(), monitor.scale_factor());
-	let screens = NSScreen::screens(mtm);
-	let primary_height = screens.firstObject()?.frame().size.height;
-	let frames: Vec<NSRect> = screens.iter().map(|screen| screen.frame()).collect();
-	let desktop = |frame: &NSRect| logical_from_ns(*frame).flipped(primary_height);
+/// Returns the `CGDirectDisplayID` of `screen` (`deviceDescription[@"NSScreenNumber"]`).
+fn screen_display_id(screen: &NSScreen) -> Option<u32> {
+	let description = screen.deviceDescription();
+	let value = description.objectForKey(ns_string!("NSScreenNumber"))?;
+	let number = value.downcast::<NSNumber>().ok()?;
+	Some(number.unsignedIntValue())
+}
 
-	if let Some(frame) = frames
+/// Finds the `NSScreen` that corresponds to `monitor`.
+///
+/// The screen whose `NSScreenNumber` equals the monitor's `CGDirectDisplayID` wins. When
+/// no screen reports that id (some docks briefly report none), the monitor rectangle —
+/// top-left-origin CoreGraphics desktop space — is compared against each screen frame
+/// flipped by the primary screen's height. Returns `None` when no connected screen
+/// matches, i.e. the monitor was unplugged.
+fn ns_screen_for(monitor: &MonitorHandle, mtm: MainThreadMarker) -> Option<Retained<NSScreen>> {
+	let screens = NSScreen::screens(mtm);
+	let display_id = monitor.native_id();
+	if let Some(screen) = screens
 		.iter()
-		.find(|frame| desktop(frame).approx_eq(&target, FRAME_MATCH_TOLERANCE))
+		.find(|screen| screen_display_id(screen) == Some(display_id))
 	{
-		return Some(*frame);
+		return Some(screen);
 	}
-	frames
+
+	let target = LogicalRect::from_physical(monitor.position(), monitor.size(), monitor.scale_factor());
+	let primary_height = screens.firstObject()?.frame().size.height;
+	let desktop = |screen: &NSScreen| logical_from_ns(screen.frame()).flipped(primary_height);
+	if let Some(screen) = screens
 		.iter()
-		.map(|frame| (frame, target.overlap_ratio(&desktop(frame))))
+		.find(|screen| desktop(screen).approx_eq(&target, FRAME_MATCH_TOLERANCE))
+	{
+		return Some(screen);
+	}
+	screens
+		.iter()
+		.map(|screen| {
+			let ratio = target.overlap_ratio(&desktop(&screen));
+			(screen, ratio)
+		})
 		.filter(|(_, ratio)| *ratio >= FRAME_MIN_OVERLAP)
 		.max_by(|(_, left), (_, right)| left.total_cmp(right))
-		.map(|(frame, _)| *frame)
+		.map(|(screen, _)| screen)
+}
+
+/// AppKit details of a connected monitor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenInfo {
+	/// `NSScreen.localizedName`, e.g. `"DELL U2723QE"` or `"Built-in Retina Display"`.
+	pub localized_name: Option<String>,
+	/// Whether this is the primary display (the first entry of `NSScreen.screens`).
+	pub is_primary: bool,
+}
+
+/// Looks up the `NSScreen` details of `monitor`.
+///
+/// Returns `None` off the main thread or when no `NSScreen` corresponds to the monitor
+/// (it was unplugged); callers then fall back to the winit name and geometry.
+pub fn screen_info(monitor: &MonitorHandle) -> Option<ScreenInfo> {
+	let mtm = MainThreadMarker::new()?;
+	let screen = ns_screen_for(monitor, mtm)?;
+	let primary_id = NSScreen::screens(mtm)
+		.firstObject()
+		.and_then(|primary| screen_display_id(&primary));
+	let is_primary = match (primary_id, screen_display_id(&screen)) {
+		(Some(primary), Some(own)) => primary == own,
+		_ => monitor.position() == winit::dpi::PhysicalPosition::new(0, 0),
+	};
+	let localized_name = screen.localizedName().to_string();
+	let localized_name = localized_name.trim();
+	Some(ScreenInfo {
+		localized_name: (!localized_name.is_empty()).then(|| localized_name.to_owned()),
+		is_primary,
+	})
 }
 
 /// Places `window` borderless over `monitor`; see the module docs for the AppKit settings.
@@ -124,9 +192,9 @@ pub fn configure_output_window(
 	elevate: bool,
 ) -> Result<OutputPlacement, PlatformError> {
 	let mtm = MainThreadMarker::new().ok_or(PlatformError::NotMainThread)?;
-	let frame = screen_frame_for(monitor, mtm).ok_or_else(|| {
-		PlatformError::MonitorUnavailable(monitor.name().unwrap_or_else(|| "unnamed display".to_owned()))
-	})?;
+	let frame = ns_screen_for(monitor, mtm)
+		.map(|screen| screen.frame())
+		.ok_or_else(|| PlatformError::MonitorUnavailable(DISCONNECTED_DISPLAY_NAME.to_owned()))?;
 	let ns_window = ns_window(window, mtm)?;
 
 	if window.fullscreen().is_some() {
@@ -173,6 +241,40 @@ pub fn lower_output_window(window: &Window) -> Result<(), PlatformError> {
 	let mtm = MainThreadMarker::new().ok_or(PlatformError::NotMainThread)?;
 	ns_window(window, mtm)?.setLevel(NSNormalWindowLevel);
 	Ok(())
+}
+
+/// An `NSProcessInfo` activity that keeps App Nap and timer coalescing away from MUR.
+///
+/// The activity ends when the value is dropped.
+pub struct AppNapActivity {
+	activity: Retained<ProtocolObject<dyn NSObjectProtocol>>,
+}
+
+impl std::fmt::Debug for AppNapActivity {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter.debug_struct("AppNapActivity").finish_non_exhaustive()
+	}
+}
+
+impl AppNapActivity {
+	/// Begins a `UserInitiated | LatencyCritical` activity explaining live playback.
+	pub fn begin() -> Self {
+		let reason = NSString::from_str("MUR live video output must render at a steady 60 fps");
+		let activity = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+			NSActivityOptions::UserInitiated | NSActivityOptions::LatencyCritical,
+			&reason,
+		);
+		Self { activity }
+	}
+}
+
+impl Drop for AppNapActivity {
+	fn drop(&mut self) {
+		// SAFETY: `self.activity` is the token returned by `beginActivityWithOptions:reason:`
+		// on the shared process info, which is exactly the type `endActivity:` expects, and
+		// it is ended once because `drop` runs once.
+		unsafe { NSProcessInfo::processInfo().endActivity(&self.activity) };
+	}
 }
 
 define_class!(

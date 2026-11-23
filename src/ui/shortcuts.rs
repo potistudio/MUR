@@ -8,9 +8,10 @@
 //!
 //! Two rules keep the map safe on stage:
 //!
-//! - While the quit confirmation guard is open (SPEC §9.2) every key except
-//!   `Enter` and `Escape` is swallowed, so a live-performance keystroke can never
-//!   reach a layer behind the dialog. That check runs first, which keeps the
+//! - While the quit confirmation guard is open (SPEC §9.2) the map answers only
+//!   three gestures: pressing the quit shortcut again confirms, `Escape`
+//!   cancels, and everything else — including `Enter`, which triggers clips
+//!   during a set — is swallowed (`None`). That check runs first, which keeps the
 //!   dialog answerable even when an egui widget holds keyboard focus.
 //! - While egui is capturing keyboard input (a text field has focus) nothing is
 //!   mapped at all.
@@ -71,7 +72,7 @@ pub const SHORTCUT_LEGEND: &[ShortcutEntry] = &[
 	},
 	ShortcutEntry {
 		keys: "Shift + R",
-		description: "Retrigger all playing layers",
+		description: "Retrigger all active layers",
 	},
 	ShortcutEntry {
 		keys: "Space",
@@ -162,7 +163,7 @@ pub const SHORTCUT_LEGEND: &[ShortcutEntry] = &[
 		description: "Strobe speed + / -",
 	},
 	ShortcutEntry {
-		keys: "F12",
+		keys: "F12 (Ctrl/Cmd + F12 reserved)",
 		description: "Reset all effects",
 	},
 	ShortcutEntry {
@@ -194,7 +195,7 @@ pub const SHORTCUT_LEGEND: &[ShortcutEntry] = &[
 		description: "Request exit (confirmation guard)",
 	},
 	ShortcutEntry {
-		keys: "Enter / Escape (in dialog)",
+		keys: "Repeat quit key / Escape (in dialog)",
 		description: "Confirm / cancel exit",
 	},
 ];
@@ -207,9 +208,9 @@ pub const SHORTCUT_LEGEND: &[ShortcutEntry] = &[
 /// follows the character the operator actually sees, which keeps the legend
 /// truthful on non-QWERTY keyboards.
 ///
-/// Returns `None` for unmapped keys, while the quit guard is open, and while
-/// egui has keyboard focus. Key releases are the caller's responsibility: pass
-/// only `ElementState::Pressed` events in.
+/// Returns `None` for unmapped keys, while the quit guard is open (except for the
+/// gestures that answer it), and while egui has keyboard focus. Key releases are
+/// the caller's responsibility: pass only `ElementState::Pressed` events in.
 pub fn map_key_event(
 	key: &Key,
 	physical: PhysicalKey,
@@ -219,21 +220,22 @@ pub fn map_key_event(
 	egui_wants_keyboard: bool,
 ) -> Option<UiCommand> {
 	if exit_confirm_open {
-		// SPEC §9.2: the guard must swallow everything except its own answers,
-		// otherwise a stray keystroke would change the live output behind it.
-		// Both the named key and the physical code are checked, because some
-		// platforms report Return without a usable character.
+		// SPEC §9.2: the guard only accepts its own answers, otherwise a stray
+		// keystroke would change the live output behind it. `Enter` is deliberately
+		// swallowed: triggering clips with `Enter` is the most common live gesture,
+		// and it must never end the show.
 		let is_enter = matches!(key, Key::Named(NamedKey::Enter))
 			|| matches!(physical, PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter));
+		if is_enter {
+			return None;
+		}
 		let is_escape =
 			matches!(key, Key::Named(NamedKey::Escape)) || matches!(physical, PhysicalKey::Code(KeyCode::Escape));
-		return if is_enter {
-			Some(UiCommand::ConfirmExit)
-		} else if is_escape {
-			Some(UiCommand::CancelExit)
-		} else {
-			None
-		};
+		if is_escape {
+			return Some(UiCommand::CancelExit);
+		}
+		// Only a second quit gesture confirms; every other key is swallowed.
+		return is_quit_gesture(key, physical, KeyMods::from_state(modifiers)).then_some(UiCommand::ConfirmExit);
 	}
 
 	if egui_wants_keyboard {
@@ -255,6 +257,24 @@ pub fn map_key_event(
 		LogicalKey::Enter => map_enter(mods, focused_layer),
 		LogicalKey::Escape => map_escape(mods),
 		LogicalKey::Other => None,
+	}
+}
+
+// ------------------------------------------------------------------ quit guard
+
+/// Returns `true` when the pressed key is one of the quit shortcuts.
+///
+/// The same predicate drives the initial [`UiCommand::RequestExit`] and the
+/// second press that confirms the dialog, so the two can never disagree.
+fn is_quit_gesture(key: &Key, physical: PhysicalKey, mods: KeyMods) -> bool {
+	match resolve_logical_key(key, physical) {
+		// `Cmd + Q` / `Ctrl + Q` (Shift is tolerated, `Alt` is not).
+		LogicalKey::Letter('q') => {
+			(mods.meta && !mods.control && !mods.alt) || (mods.control && !mods.alt && !mods.meta)
+		}
+		// `Alt + F4`.
+		LogicalKey::Function(4) => mods.alt && !mods.control && !mods.meta,
+		_ => false,
 	}
 }
 
@@ -538,8 +558,10 @@ fn map_control_digit(number: u8, shift: bool) -> Option<UiCommand> {
 fn map_letter(letter: char, mods: KeyMods, focused_layer: LayerIndex) -> Option<UiCommand> {
 	if mods.command() {
 		return match letter {
-			'o' => Some(UiCommand::ToggleOutputEnabled),
-			'q' if mods.meta && !mods.control => Some(UiCommand::RequestExit),
+			'o' if !mods.alt => Some(UiCommand::ToggleOutputEnabled),
+			// `Cmd + Q` and `Ctrl + Q` both request the guarded exit; `Alt` is
+			// excluded so an Option/Alt chord cannot quit a live set.
+			'q' if (mods.meta && !mods.control && !mods.alt) || mods.control_only() => Some(UiCommand::RequestExit),
 			_ => None,
 		};
 	}
@@ -591,6 +613,10 @@ fn map_letter(letter: char, mods: KeyMods, focused_layer: LayerIndex) -> Option<
 }
 
 /// Maps the function row onto the master effects and the quit guard.
+///
+/// `F4` (blackout) and `F12` (reset all effects) only fire unmodified: the `F12`
+/// chord is reserved for the OS, and a stray modifier must not blank the output
+/// mid-set.
 fn map_function(number: u8, mods: KeyMods) -> Option<UiCommand> {
 	if mods.command() {
 		return None;
@@ -608,7 +634,7 @@ fn map_function(number: u8, mods: KeyMods) -> Option<UiCommand> {
 		3 if shift => Some(UiCommand::AdjustStrobeIntensity(EFFECT_INTENSITY_STEP)),
 		3 => Some(UiCommand::ToggleStrobe),
 		4 if mods.alt => Some(UiCommand::RequestExit),
-		4 => Some(UiCommand::ToggleBlackout),
+		4 if mods.plain() => Some(UiCommand::ToggleBlackout),
 		5 => Some(UiCommand::AdjustMasterDimmer(-MASTER_DIMMER_STEP)),
 		6 => Some(UiCommand::AdjustMasterDimmer(MASTER_DIMMER_STEP)),
 		7 if shift => Some(UiCommand::AdjustBrightness(-COLOR_GRADE_STEP)),
@@ -619,7 +645,7 @@ fn map_function(number: u8, mods: KeyMods) -> Option<UiCommand> {
 		9 => Some(UiCommand::AdjustSaturation(COLOR_GRADE_STEP)),
 		10 if shift => Some(UiCommand::AdjustStrobeSpeedHz(-STROBE_SPEED_STEP_HZ)),
 		10 => Some(UiCommand::AdjustStrobeSpeedHz(STROBE_SPEED_STEP_HZ)),
-		12 => Some(UiCommand::ResetAllEffects),
+		12 if mods.plain() => Some(UiCommand::ResetAllEffects),
 		_ => None,
 	}
 }
@@ -636,6 +662,9 @@ fn map_bracket(delta: i32, mods: KeyMods, focused_layer: LayerIndex) -> Option<U
 }
 
 /// Maps the backquote key, the ergonomic alternative to `F4`.
+///
+/// `Shift + backquote` stays bound because `` ` `` and `~` live on the same key
+/// on most layouts; `Alt` and `Cmd`/`Ctrl` chords are left to the application.
 fn map_backquote(mods: KeyMods) -> Option<UiCommand> {
 	if mods.alt || mods.command() {
 		return None;
@@ -1035,10 +1064,40 @@ mod tests {
 			Some(UiCommand::RequestExit)
 		);
 		assert_eq!(
+			by_char("q", KeyCode::KeyQ, ModifiersState::CONTROL),
+			Some(UiCommand::RequestExit),
+			"Ctrl + Q must request exit, not layer opacity"
+		);
+		assert_eq!(
+			by_char("q", KeyCode::KeyQ, ModifiersState::CONTROL | ModifiersState::SHIFT),
+			Some(UiCommand::RequestExit),
+			"Ctrl + Shift + Q is still a quit request"
+		);
+		assert_eq!(
+			by_char("q", KeyCode::KeyQ, ModifiersState::SUPER | ModifiersState::ALT),
+			None
+		);
+		assert_eq!(
 			by_named(NamedKey::F4, KeyCode::F4, ModifiersState::ALT),
 			Some(UiCommand::RequestExit)
 		);
 		assert_eq!(by_code(KeyCode::NumpadEnter, ModifiersState::ALT), None);
+	}
+
+	#[test]
+	fn plain_function_keys_ignore_stray_modifiers() {
+		// F4 / F12 only fire unmodified; Alt + F4 requests exit instead.
+		assert_eq!(by_code(KeyCode::F4, ModifiersState::SHIFT), None);
+		assert_eq!(by_code(KeyCode::F12, ModifiersState::SHIFT), None);
+		assert_eq!(by_code(KeyCode::F12, ModifiersState::CONTROL), None);
+		assert_eq!(
+			by_code(KeyCode::F4, ModifiersState::empty()),
+			Some(UiCommand::ToggleBlackout)
+		);
+		assert_eq!(
+			by_code(KeyCode::F12, ModifiersState::empty()),
+			Some(UiCommand::ResetAllEffects)
+		);
 	}
 
 	#[test]
@@ -1221,64 +1280,78 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn exit_guard_swallows_everything_but_enter_and_escape() {
-		let enter = map_key_event(
-			&Key::Named(NamedKey::Enter),
-			PhysicalKey::Code(KeyCode::Enter),
-			ModifiersState::empty(),
-			focused(),
-			true,
-			false,
-		);
-		assert_eq!(enter, Some(UiCommand::ConfirmExit));
+	/// Maps a key while the quit confirmation dialog is open.
+	fn guarded(key: &Key, physical: PhysicalKey, mods: ModifiersState) -> Option<UiCommand> {
+		map_key_event(key, physical, mods, focused(), true, false)
+	}
 
-		let escape = map_key_event(
-			&Key::Named(NamedKey::Escape),
-			PhysicalKey::Code(KeyCode::Escape),
-			ModifiersState::empty(),
-			focused(),
-			true,
-			false,
+	#[test]
+	fn exit_guard_swallows_everything_but_the_quit_key_and_escape() {
+		// `Enter` triggers clips all night; it must never close the show.
+		for (key, code) in [
+			(Key::Named(NamedKey::Enter), KeyCode::Enter),
+			(Key::Named(NamedKey::Enter), KeyCode::NumpadEnter),
+			(Key::Character("\r".into()), KeyCode::Enter),
+			(Key::Character("\r".into()), KeyCode::NumpadEnter),
+		] {
+			assert_eq!(
+				guarded(&key, PhysicalKey::Code(code), ModifiersState::empty()),
+				None,
+				"{code:?} must not confirm the exit dialog"
+			);
+		}
+
+		// `Escape` cancels.
+		assert_eq!(
+			guarded(
+				&Key::Named(NamedKey::Escape),
+				PhysicalKey::Code(KeyCode::Escape),
+				ModifiersState::empty()
+			),
+			Some(UiCommand::CancelExit)
 		);
-		assert_eq!(escape, Some(UiCommand::CancelExit));
+
+		// Repeating the quit gesture confirms.
+		for (key, code, mods) in [
+			(Key::Character("q".into()), KeyCode::KeyQ, ModifiersState::SUPER),
+			(Key::Character("q".into()), KeyCode::KeyQ, ModifiersState::CONTROL),
+			(Key::Named(NamedKey::F4), KeyCode::F4, ModifiersState::ALT),
+		] {
+			assert_eq!(
+				guarded(&key, PhysicalKey::Code(code), mods),
+				Some(UiCommand::ConfirmExit),
+				"{code:?} + {mods:?} must confirm"
+			);
+		}
+
+		// A bare `Q` (opacity) is not a quit gesture, so it is swallowed.
+		assert_eq!(
+			guarded(
+				&Key::Character("q".into()),
+				PhysicalKey::Code(KeyCode::KeyQ),
+				ModifiersState::empty()
+			),
+			None
+		);
 
 		// Live controls must not leak through the guard.
 		for code in [
 			KeyCode::Digit1,
 			KeyCode::KeyR,
 			KeyCode::F4,
+			KeyCode::F12,
 			KeyCode::Space,
 			KeyCode::Backquote,
 			KeyCode::KeyX,
 		] {
 			assert_eq!(
-				map_key_event(
+				guarded(
 					&Key::Unidentified(winit::keyboard::NativeKey::Unidentified),
 					PhysicalKey::Code(code),
-					ModifiersState::empty(),
-					focused(),
-					true,
-					false,
+					ModifiersState::empty()
 				),
 				None,
 				"{code:?} must be blocked by the exit guard"
-			);
-		}
-
-		// A Return reported without a named key still answers the dialog.
-		for code in [KeyCode::Enter, KeyCode::NumpadEnter] {
-			assert_eq!(
-				map_key_event(
-					&Key::Character("\r".into()),
-					PhysicalKey::Code(code),
-					ModifiersState::empty(),
-					focused(),
-					true,
-					false,
-				),
-				Some(UiCommand::ConfirmExit),
-				"{code:?}"
 			);
 		}
 	}
@@ -1302,14 +1375,14 @@ mod tests {
 		// The exit guard is checked first, so its dialog stays answerable.
 		assert_eq!(
 			map_key_event(
-				&Key::Named(NamedKey::Enter),
-				PhysicalKey::Code(KeyCode::Enter),
+				&Key::Named(NamedKey::Escape),
+				PhysicalKey::Code(KeyCode::Escape),
 				ModifiersState::empty(),
 				focused(),
 				true,
 				true,
 			),
-			Some(UiCommand::ConfirmExit),
+			Some(UiCommand::CancelExit),
 			"the exit guard outranks egui capture"
 		);
 	}
@@ -1350,6 +1423,119 @@ mod tests {
 		keys.sort_unstable();
 		keys.dedup();
 		assert_eq!(keys.len(), SHORTCUT_LEGEND.len(), "duplicate legend rows");
+	}
+
+	/// Commands produced by every gesture documented in one `SHORTCUT_LEGEND` row.
+	///
+	/// `None` means the test does not know the row yet, which makes adding a legend
+	/// entry without a real mapping fail [`every_legend_row_maps_to_a_command`].
+	fn legend_commands(keys: &str) -> Option<Vec<Option<UiCommand>>> {
+		let plain = ModifiersState::empty();
+		let shift = ModifiersState::SHIFT;
+		let alt = ModifiersState::ALT;
+		let control = ModifiersState::CONTROL;
+		let command = ModifiersState::SUPER;
+
+		let chars = |pairs: &[(&str, KeyCode, ModifiersState)]| -> Vec<Option<UiCommand>> {
+			pairs
+				.iter()
+				.map(|(text, code, mods)| by_char(text, *code, *mods))
+				.collect()
+		};
+		let codes = |pairs: &[(KeyCode, ModifiersState)]| -> Vec<Option<UiCommand>> {
+			pairs.iter().map(|(code, mods)| by_code(*code, *mods)).collect()
+		};
+		let layers = |mods: ModifiersState| -> Vec<Option<UiCommand>> {
+			DIGITS.iter().map(|(code, _)| by_code(*code, mods)).collect()
+		};
+
+		let commands = match keys {
+			"1 / 2 / 3 / 4" => layers(plain),
+			"Shift + 1-4" => layers(shift),
+			"Alt + 1-4" => layers(alt),
+			"Tab / Shift + Tab" => vec![
+				by_named(NamedKey::Tab, KeyCode::Tab, plain),
+				by_named(NamedKey::Tab, KeyCode::Tab, shift),
+			],
+			"R" => chars(&[("r", KeyCode::KeyR, plain)]),
+			"Shift + R" => chars(&[("R", KeyCode::KeyR, shift)]),
+			"Space" => vec![by_named(NamedKey::Space, KeyCode::Space, plain)],
+			"L" => chars(&[("l", KeyCode::KeyL, plain)]),
+			"X" => chars(&[("x", KeyCode::KeyX, plain)]),
+			"Q / W" => chars(&[("q", KeyCode::KeyQ, plain), ("w", KeyCode::KeyW, plain)]),
+			"A / D" => chars(&[("a", KeyCode::KeyA, plain), ("d", KeyCode::KeyD, plain)]),
+			"S" => chars(&[("s", KeyCode::KeyS, plain)]),
+			"Shift + S" => chars(&[("S", KeyCode::KeyS, shift)]),
+			"B / Shift + B" => chars(&[("b", KeyCode::KeyB, plain), ("B", KeyCode::KeyB, shift)]),
+			"[ / ]" => chars(&[("[", KeyCode::BracketLeft, plain), ("]", KeyCode::BracketRight, plain)]),
+			"Enter" => vec![
+				by_named(NamedKey::Enter, KeyCode::Enter, plain),
+				by_code(KeyCode::NumpadEnter, plain),
+			],
+			"F1" => codes(&[(KeyCode::F1, plain)]),
+			"Shift + F1 / Alt + F1" => codes(&[(KeyCode::F1, shift), (KeyCode::F1, alt)]),
+			"F2" => codes(&[(KeyCode::F2, plain)]),
+			"Shift + F2 / Alt + F2" => codes(&[(KeyCode::F2, shift), (KeyCode::F2, alt)]),
+			"F3" => codes(&[(KeyCode::F3, plain)]),
+			"Shift + F3 / Alt + F3" => codes(&[(KeyCode::F3, shift), (KeyCode::F3, alt)]),
+			"F4 or `" => vec![by_code(KeyCode::F4, plain), by_char("`", KeyCode::Backquote, plain)],
+			"F5 / F6" => codes(&[(KeyCode::F5, plain), (KeyCode::F6, plain)]),
+			"F7 / Shift + F7" => codes(&[(KeyCode::F7, plain), (KeyCode::F7, shift)]),
+			"F8 / Shift + F8" => codes(&[(KeyCode::F8, plain), (KeyCode::F8, shift)]),
+			"F9 / Shift + F9" => codes(&[(KeyCode::F9, plain), (KeyCode::F9, shift)]),
+			"F10 / Shift + F10" => codes(&[(KeyCode::F10, plain), (KeyCode::F10, shift)]),
+			"F12 (Ctrl/Cmd + F12 reserved)" => codes(&[(KeyCode::F12, plain)]),
+			"Ctrl + 1 / 2 / 3 / 4" => codes(&[
+				(KeyCode::Digit1, control),
+				(KeyCode::Digit2, control),
+				(KeyCode::Digit3, control),
+				(KeyCode::Digit4, control),
+			]),
+			"Ctrl + 5-9, Ctrl + 0" => codes(&[
+				(KeyCode::Digit5, control),
+				(KeyCode::Digit6, control),
+				(KeyCode::Digit7, control),
+				(KeyCode::Digit8, control),
+				(KeyCode::Digit9, control),
+				(KeyCode::Digit0, control),
+			]),
+			"Ctrl + O or Cmd + O" => chars(&[("o", KeyCode::KeyO, control), ("o", KeyCode::KeyO, command)]),
+			"H or ?" => chars(&[("h", KeyCode::KeyH, plain), ("?", KeyCode::Slash, shift)]),
+			"G" => chars(&[("g", KeyCode::KeyG, plain)]),
+			"Escape" => vec![by_named(NamedKey::Escape, KeyCode::Escape, plain)],
+			"Cmd + Q / Ctrl + Q / Alt + F4" => vec![
+				by_char("q", KeyCode::KeyQ, command),
+				by_char("q", KeyCode::KeyQ, control),
+				by_named(NamedKey::F4, KeyCode::F4, alt),
+			],
+			"Repeat quit key / Escape (in dialog)" => vec![
+				guarded(&Key::Character("q".into()), PhysicalKey::Code(KeyCode::KeyQ), command),
+				guarded(&Key::Named(NamedKey::Escape), PhysicalKey::Code(KeyCode::Escape), plain),
+			],
+			_ => return None,
+		};
+		Some(commands)
+	}
+
+	#[test]
+	fn every_legend_row_maps_to_a_command() {
+		let mut uncovered: Vec<&str> = Vec::new();
+		for entry in SHORTCUT_LEGEND {
+			let Some(commands) = legend_commands(entry.keys) else {
+				uncovered.push(entry.keys);
+				continue;
+			};
+			assert!(!commands.is_empty(), "{} has no probe", entry.keys);
+			for (index, command) in commands.iter().enumerate() {
+				assert!(
+					command.is_some(),
+					"`{}` gesture #{index} is documented but not mapped (`{}`)",
+					entry.keys,
+					entry.description
+				);
+			}
+		}
+		assert!(uncovered.is_empty(), "undocumented probes: {uncovered:?}");
 	}
 
 	#[test]

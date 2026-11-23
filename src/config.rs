@@ -6,6 +6,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -112,29 +113,36 @@ impl ProjectConfig {
 		let mut config = Self::parse(&contents, path)?;
 		let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
 		config.resolve_paths(base_dir);
-		if let Some(effects) = config.effects.as_mut() {
-			effects.clamp_all();
-		}
 		Ok(config)
 	}
 
 	/// Parses project file contents according to the path's extension.
+	///
+	/// Master effect values are clamped with [`MasterEffects::clamp_all`], so a
+	/// project file loaded through this function always yields exactly the same
+	/// values as [`ProjectConfig::load`].
 	pub fn parse(contents: &str, path: &Path) -> Result<Self, ConfigError> {
 		let extension = path
 			.extension()
 			.and_then(|ext| ext.to_str())
 			.map(str::to_ascii_lowercase);
-		match extension.as_deref() {
+		let mut config: Self = match extension.as_deref() {
 			Some("toml") => {
-				toml::from_str(contents).map_err(|error| ConfigError::parse(path, "TOML", error.to_string()))
+				toml::from_str(contents).map_err(|error| ConfigError::parse(path, "TOML", error.to_string()))?
 			}
 			Some("json") => {
-				serde_json::from_str(contents).map_err(|error| ConfigError::parse(path, "JSON", error.to_string()))
+				serde_json::from_str(contents).map_err(|error| ConfigError::parse(path, "JSON", error.to_string()))?
 			}
-			_ => Err(ConfigError::UnsupportedFormat {
-				path: path.display().to_string(),
-			}),
+			_ => {
+				return Err(ConfigError::UnsupportedFormat {
+					path: path.display().to_string(),
+				});
+			}
+		};
+		if let Some(effects) = config.effects.as_mut() {
+			effects.clamp_all();
 		}
+		Ok(config)
 	}
 
 	/// Rewrites every relative media path to be absolute against `base_dir`.
@@ -203,8 +211,10 @@ impl PersistedLayerState {
 
 	/// Rebuilds a layer, binding `clip` when the persisted path could be resolved.
 	///
-	/// Restored layers are stopped on their first frame: live output must never
-	/// start moving on its own after a crash recovery.
+	/// The persisted playhead is restored so the operator returns to the frame
+	/// they left, but the layer stays [`PlaybackState::Stopped`](crate::model::PlaybackState::Stopped): live output must
+	/// never start moving on its own after a crash recovery. Invalid playhead
+	/// values (negative or non-finite) fall back to frame `0`.
 	pub fn restore(&self, clip: Option<ClipId>) -> LayerState {
 		let mut layer = LayerState {
 			selected_clip: clip,
@@ -215,6 +225,11 @@ impl PersistedLayerState {
 		};
 		layer.set_speed(self.speed);
 		layer.set_opacity(self.opacity);
+		layer.playhead_frame = if self.playhead_frame.is_finite() && self.playhead_frame >= 0.0 {
+			self.playhead_frame
+		} else {
+			0.0
+		};
 		layer
 	}
 
@@ -235,6 +250,14 @@ pub struct PersistedState {
 	/// Every clip that was loaded, in grid order.
 	pub clip_paths: Vec<PathBuf>,
 	/// Per-layer settings, always four entries.
+	///
+	/// Deserialization is tolerant: files written by older or newer builds with
+	/// fewer or more than four entries are padded with defaults and truncated, so
+	/// a stale `state.json` never blocks startup.
+	#[serde(
+		default = "default_persisted_layers",
+		deserialize_with = "deserialize_persisted_layers"
+	)]
 	pub layers: [PersistedLayerState; 4],
 	/// Master effect values.
 	pub effects: MasterEffects,
@@ -251,7 +274,7 @@ impl Default for PersistedState {
 		Self {
 			version: STATE_VERSION,
 			clip_paths: Vec::new(),
-			layers: std::array::from_fn(|_| PersistedLayerState::default()),
+			layers: default_persisted_layers(),
 			effects: MasterEffects::default(),
 			focused_layer: 1,
 			output: OutputDisplaySelection::default(),
@@ -312,6 +335,29 @@ impl PersistedState {
 	}
 }
 
+/// Default per-layer settings used when a state file has no layer entry.
+fn default_persisted_layers() -> [PersistedLayerState; 4] {
+	std::array::from_fn(|_| PersistedLayerState::default())
+}
+
+/// Reads any number of persisted layers into the fixed four-layer array.
+///
+/// Missing entries are filled with [`PersistedLayerState::default`], and entries
+/// past the fourth layer are ignored, because MUR always has exactly four
+/// layers. This keeps older (0/1/3-entry) and newer (5-entry) state files
+/// loadable instead of rejecting them as malformed.
+fn deserialize_persisted_layers<'de, D>(deserializer: D) -> Result<[PersistedLayerState; 4], D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	let entries = Vec::<PersistedLayerState>::deserialize(deserializer)?;
+	let mut layers = default_persisted_layers();
+	for (slot, entry) in layers.iter_mut().zip(entries) {
+		*slot = entry;
+	}
+	Ok(layers)
+}
+
 /// Writes `state` to `path` through a sibling `.tmp` file and an atomic rename.
 pub fn save_state_atomic(path: &Path, state: &PersistedState) -> Result<(), ConfigError> {
 	let json = serde_json::to_string_pretty(state).map_err(|error| ConfigError::Serialize {
@@ -333,7 +379,18 @@ pub fn save_state_atomic(path: &Path, state: &PersistedState) -> Result<(), Conf
 	std::fs::rename(&temp_path, path).map_err(|error| {
 		let _ = std::fs::remove_file(&temp_path);
 		ConfigError::io(path, error)
-	})
+	})?;
+
+	// POSIX only guarantees that a rename is durable once the containing
+	// directory has been flushed; this is best effort and never fails a save.
+	#[cfg(unix)]
+	if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+		&& let Ok(dir) = std::fs::File::open(parent)
+	{
+		let _ = dir.sync_all();
+	}
+
+	Ok(())
 }
 
 /// Loads a persisted snapshot.
@@ -392,6 +449,16 @@ impl StateSaver {
 		self.dirty
 	}
 
+	/// Records that the current state was written at `now`.
+	///
+	/// Callers that hand the disk write to a background task use this instead of
+	/// [`StateSaver::new`] to keep their custom debounce interval while clearing
+	/// the dirty flag.
+	pub fn mark_saved(&mut self, now: Instant) {
+		self.last_save = now;
+		self.dirty = false;
+	}
+
 	/// Instant of the last save attempt.
 	pub fn last_save(&self) -> Instant {
 		self.last_save
@@ -440,10 +507,18 @@ fn resolve_relative(path: &Path, base_dir: &Path) -> PathBuf {
 	}
 }
 
-/// Builds the `path.tmp` sibling used for atomic writes.
+/// Process-wide counter that makes every staging file name unique.
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Builds the `path.tmp-{pid}-{seq}` sibling used for atomic writes.
+///
+/// Both the process id and a process-wide sequence number are part of the name,
+/// so two MUR instances (or two concurrent saves) writing the same state file
+/// can never truncate each other's staging file before the final rename.
 fn sibling_temp_path(path: &Path) -> PathBuf {
+	let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
 	let mut temp = path.as_os_str().to_os_string();
-	temp.push(".tmp");
+	temp.push(format!(".tmp-{}-{sequence}", std::process::id()));
 	PathBuf::from(temp)
 }
 
@@ -666,6 +741,124 @@ mod tests {
 		assert!(load_state(&future).unwrap().is_none());
 
 		std::fs::remove_dir_all(&dir).ok();
+	}
+
+	#[test]
+	fn persisted_layers_tolerate_any_entry_count() {
+		let layer = |opacity: f32| format!(r#"{{"opacity":{opacity}}}"#);
+
+		// Empty list: four default layers.
+		let state: PersistedState = serde_json::from_str(r#"{"version":1,"layers":[]}"#).unwrap();
+		assert_eq!(state.layers, default_persisted_layers());
+
+		// One entry: padded with defaults.
+		let json = format!(r#"{{"version":1,"layers":[{}]}}"#, layer(0.25));
+		let state: PersistedState = serde_json::from_str(&json).unwrap();
+		assert_eq!(state.layers[0].opacity, 0.25);
+		assert_eq!(state.layers[1], PersistedLayerState::default());
+		assert_eq!(state.layers[3].playback_mode, PlaybackMode::Loop);
+
+		// Three entries: the fourth layer keeps its default.
+		let json = format!(
+			r#"{{"version":1,"layers":[{},{},{}]}}"#,
+			layer(0.1),
+			layer(0.2),
+			layer(0.3)
+		);
+		let state: PersistedState = serde_json::from_str(&json).unwrap();
+		assert_eq!(state.layers[2].opacity, 0.3);
+		assert_eq!(state.layers[3], PersistedLayerState::default());
+
+		// Five entries: the fifth layer is ignored, not an error.
+		let json = format!(
+			r#"{{"version":1,"layers":[{},{},{},{},{}]}}"#,
+			layer(0.1),
+			layer(0.2),
+			layer(0.3),
+			layer(0.4),
+			layer(0.5)
+		);
+		let state: PersistedState = serde_json::from_str(&json).unwrap();
+		assert_eq!(state.layers.len(), 4);
+		assert_eq!(state.layers[3].opacity, 0.4);
+
+		// A missing `layers` key falls back to four default layers.
+		let state: PersistedState = serde_json::from_str(r#"{"version":1}"#).unwrap();
+		assert_eq!(state.layers, default_persisted_layers());
+
+		// Serialization still emits exactly four entries.
+		let json = serde_json::to_string(&PersistedState::default()).unwrap();
+		let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+		assert_eq!(value["layers"].as_array().map(Vec::len), Some(4));
+	}
+
+	#[test]
+	fn restore_keeps_a_valid_playhead_and_rejects_bad_values() {
+		let mut app = AppState::default();
+		app.upsert_clip(clip(1, "/media/intro.mov"));
+		let mut state = PersistedState::capture(&app);
+		state.layers[0].clip_path = Some(PathBuf::from("/media/intro.mov"));
+		state.layers[0].playhead_frame = 37.5;
+
+		let restored = state.layers[0].restore(Some(ClipId(1)));
+		assert_eq!(restored.playhead_frame, 37.5);
+		assert_eq!(restored.playback_state, PlaybackState::Stopped);
+
+		for bad in [-1.0, f64::NAN, f64::INFINITY] {
+			state.layers[0].playhead_frame = bad;
+			assert_eq!(state.layers[0].restore(Some(ClipId(1))).playhead_frame, 0.0, "{bad}");
+		}
+	}
+
+	#[test]
+	fn state_saver_mark_saved_clears_dirty_and_keeps_debounce() {
+		let mut saver = StateSaver::new(Duration::from_millis(500));
+		saver.mark_dirty();
+		assert!(saver.is_dirty());
+
+		let now = Instant::now();
+		saver.mark_saved(now);
+		assert!(!saver.is_dirty());
+		assert_eq!(saver.last_save(), now);
+
+		// The custom 500 ms debounce survives; it is not reset to the default.
+		saver.mark_dirty();
+		assert!(!saver.is_due(now + Duration::from_millis(100)));
+		assert!(saver.is_due(now + Duration::from_millis(600)));
+	}
+
+	#[test]
+	fn sibling_temp_paths_are_unique() {
+		let path = Path::new("/tmp/mur-state.json");
+		let first = sibling_temp_path(path);
+		let second = sibling_temp_path(path);
+		assert_ne!(first, second);
+		assert!(first.to_string_lossy().contains(&std::process::id().to_string()));
+		assert!(first.to_string_lossy().starts_with("/tmp/mur-state.json.tmp-"));
+		assert_eq!(first.parent(), path.parent());
+	}
+
+	#[test]
+	fn project_parse_clamps_effects() {
+		let toml = r#"
+			[effects]
+			master_dimmer = 4.5
+			strobe_speed_hz = -100.0
+		"#;
+		let effects = ProjectConfig::parse(toml, Path::new("show.toml"))
+			.unwrap()
+			.effects
+			.unwrap();
+		assert_eq!(effects.master_dimmer, 1.0);
+		assert!(effects.strobe_speed_hz > 0.0);
+
+		let json = r#"{"effects":{"master_dimmer":-3.0,"contrast":9.0}}"#;
+		let effects = ProjectConfig::parse(json, Path::new("show.json"))
+			.unwrap()
+			.effects
+			.unwrap();
+		assert_eq!(effects.master_dimmer, 0.0);
+		assert_eq!(effects.contrast, 2.0);
 	}
 
 	#[test]

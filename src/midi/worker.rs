@@ -13,6 +13,13 @@
 //! [`MidiConnectionStatus::Reconnecting`]; as soon as the same device (manual
 //! selection) or a matching Launch Control (automatic selection) reappears, the
 //! worker reconnects without any user interaction (SPEC §6.1).
+//!
+//! Automatic detection only ever connects to a Launch Control / Novation port and
+//! skips "DAW" ports (the Launch Control XL 3 exposes a separate DAW-integration
+//! port next to its MIDI port); unrelated gear is never grabbed. On macOS the
+//! worker pumps its thread's `CFRunLoop` while it waits, because CoreMIDI delivers
+//! hot-plug notifications — and refreshes the endpoint list — through the run
+//! loop of the thread that created the MIDI client.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::time::{Duration, Instant};
@@ -41,8 +48,9 @@ pub const MIDI_CONNECTION_NAME: &str = "MUR MIDI In";
 
 /// Substrings tried, in order, when no explicit port is selected.
 ///
-/// The first matching port wins; virtual loopback ports are only accepted when
-/// no physical controller matches.
+/// The first hint with a matching port wins. Among its matches a physical port
+/// named "MIDI" is preferred, then any physical port, then a virtual loopback.
+/// Ports matching no hint are never auto-selected.
 const AUTO_DETECT_HINTS: [&str; 4] = ["Launch Control XL 3", "Launch Control", "LCXL", "Novation"];
 
 /// Something the MIDI worker wants the control UI to know about.
@@ -77,8 +85,10 @@ pub enum MidiCommand {
 /// never silently falls back to a different controller while it is unplugged.
 ///
 /// With `preferred: None` the worker auto-detects: the built-in Launch Control
-/// hints are tried in order, a physical port is preferred over a virtual
-/// loopback, and finally the first available port is used.
+/// hints are tried in order, "DAW" ports are skipped, a physical "MIDI" port is
+/// preferred over other physical ports and those over virtual loopbacks. When no
+/// port matches a hint the result is `None` (the worker keeps scanning) rather
+/// than connecting to unrelated gear; such ports remain selectable explicitly.
 pub fn choose_preferred_port(ports: &[String], preferred: Option<&str>) -> Option<usize> {
 	let preferred = preferred.map(str::trim).filter(|name| !name.is_empty());
 	match preferred {
@@ -99,29 +109,33 @@ fn match_explicit_port(ports: &[String], preferred: &str) -> Option<usize> {
 	ports.iter().position(|port| port.to_lowercase().contains(&wanted))
 }
 
-/// Resolves a port using the Launch Control hints, then any available port.
+/// Resolves a port using the Launch Control hints; `None` when nothing matches.
 fn auto_detect_port(ports: &[String]) -> Option<usize> {
-	if ports.is_empty() {
-		return None;
-	}
 	for hint in AUTO_DETECT_HINTS {
 		let hint = hint.to_lowercase();
-		let mut virtual_match = None;
-		for (index, port) in ports.iter().enumerate() {
-			if !port.to_lowercase().contains(&hint) {
-				continue;
-			}
-			if is_virtual_port(port) {
-				virtual_match.get_or_insert(index);
-			} else {
-				return Some(index);
-			}
-		}
-		if virtual_match.is_some() {
-			return virtual_match;
+		let matches: Vec<(usize, &String)> = ports
+			.iter()
+			.enumerate()
+			.filter(|(_, port)| !is_daw_port(port) && port.to_lowercase().contains(&hint))
+			.collect();
+		let physical_midi = matches
+			.iter()
+			.find(|(_, port)| !is_virtual_port(port) && port.to_lowercase().contains("midi"));
+		let physical = matches.iter().find(|(_, port)| !is_virtual_port(port));
+		if let Some((index, _)) = physical_midi.or(physical).or(matches.first()) {
+			return Some(*index);
 		}
 	}
-	ports.iter().position(|port| !is_virtual_port(port)).or(Some(0))
+	None
+}
+
+/// Returns `true` for DAW-integration ports, e.g. `"Launch Control XL 3 DAW"`.
+///
+/// Matches `daw` as a whole word (split on non-alphanumeric characters), so names
+/// that merely contain those letters are not affected.
+fn is_daw_port(port: &str) -> bool {
+	port.split(|character: char| !character.is_alphanumeric())
+		.any(|word| word.eq_ignore_ascii_case("daw"))
 }
 
 /// Returns `true` for loopback ports that are not real controllers.
@@ -303,7 +317,7 @@ fn run_worker(events: &Sender<MidiEvent>, commands: &Receiver<MidiCommand>, init
 
 		state.tick(&mut scanner, events);
 
-		match commands.recv_timeout(PORT_POLL_INTERVAL) {
+		match wait_for_command(commands, PORT_POLL_INTERVAL) {
 			Ok(command) => {
 				if !state.handle_command(command, events) {
 					keep_running = false;
@@ -315,6 +329,80 @@ fn run_worker(events: &Sender<MidiEvent>, commands: &Receiver<MidiCommand>, init
 	}
 
 	state.shutdown(events);
+}
+
+/// Waits up to `timeout` for the next command.
+#[cfg(not(target_os = "macos"))]
+fn wait_for_command(commands: &Receiver<MidiCommand>, timeout: Duration) -> Result<MidiCommand, RecvTimeoutError> {
+	commands.recv_timeout(timeout)
+}
+
+/// Longest single `CFRunLoop` slice while waiting for a command.
+#[cfg(target_os = "macos")]
+const RUN_LOOP_SLICE: Duration = Duration::from_millis(50);
+
+/// Waits up to `timeout` for the next command while pumping the `CFRunLoop`.
+///
+/// CoreMIDI posts setup-change notifications (device plugged / unplugged) to the
+/// run loop of the thread that created the MIDI client, i.e. this worker thread.
+/// Without pumping it those notifications queue up and port enumeration can stay
+/// stale, so the loop alternates between short run-loop slices and command checks.
+#[cfg(target_os = "macos")]
+fn wait_for_command(commands: &Receiver<MidiCommand>, timeout: Duration) -> Result<MidiCommand, RecvTimeoutError> {
+	let deadline = Instant::now() + timeout;
+	loop {
+		match commands.try_recv() {
+			Ok(command) => return Ok(command),
+			Err(TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
+			Err(TryRecvError::Empty) => {}
+		}
+		let remaining = deadline.saturating_duration_since(Instant::now());
+		if remaining.is_zero() {
+			return Err(RecvTimeoutError::Timeout);
+		}
+		let slice = remaining.min(RUN_LOOP_SLICE);
+		if !run_loop::run_default_mode(slice) {
+			// The run loop has no sources yet (no MIDI client): plain wait instead of spinning.
+			match commands.recv_timeout(slice) {
+				Ok(command) => return Ok(command),
+				Err(RecvTimeoutError::Timeout) => {}
+				Err(RecvTimeoutError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
+			}
+		}
+	}
+}
+
+/// Minimal CoreFoundation run-loop bindings (CoreFoundation is always linked on macOS).
+#[cfg(target_os = "macos")]
+mod run_loop {
+	use std::ffi::c_void;
+	use std::time::Duration;
+
+	/// `CFRunLoopRunResult` value returned when the mode has no sources or timers.
+	const RUN_FINISHED: i32 = 1;
+
+	#[link(name = "CoreFoundation", kind = "framework")]
+	unsafe extern "C" {
+		/// `CFRunLoopMode kCFRunLoopDefaultMode` (a `CFStringRef`).
+		static kCFRunLoopDefaultMode: *const c_void;
+		/// `CFRunLoopRunResult CFRunLoopRunInMode(CFRunLoopMode, CFTimeInterval, Boolean)`.
+		fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source_handled: u8) -> i32;
+	}
+
+	/// Runs the current thread's run loop in the default mode for at most `slice`.
+	///
+	/// Returns after one source was handled or the slice elapsed. Returns `false`
+	/// when the run loop has nothing to run, so the caller must wait by other means.
+	pub(super) fn run_default_mode(slice: Duration) -> bool {
+		// SAFETY: `kCFRunLoopDefaultMode` is an immutable, process-lifetime constant
+		// exported by CoreFoundation; reading the pointer value has no side effects.
+		let mode = unsafe { kCFRunLoopDefaultMode };
+		// SAFETY: `CFRunLoopRunInMode` runs the calling thread's own run loop (created
+		// on demand), which is valid on any thread; `mode` is a valid run-loop mode
+		// and the timeout is a finite, non-negative number of seconds.
+		let result = unsafe { CFRunLoopRunInMode(mode, slice.as_secs_f64(), 1) };
+		result != RUN_FINISHED
+	}
 }
 
 /// A port currently held open by the worker.
@@ -603,6 +691,34 @@ mod tests {
 	}
 
 	#[test]
+	fn auto_detection_skips_daw_ports_and_prefers_the_midi_port() {
+		let available = ports(&["Launch Control XL 3 DAW", "Launch Control XL 3 MIDI"]);
+		assert_eq!(choose_preferred_port(&available, None), Some(1));
+
+		let available = ports(&["LCXL3 1 DAW Out", "LCXL3 1 MIDI Out", "Launch Control XL 3 DAW"]);
+		assert_eq!(choose_preferred_port(&available, None), Some(1));
+
+		// Only a DAW port: auto mode keeps scanning, explicit selection still works.
+		let available = ports(&["Launch Control XL 3 DAW"]);
+		assert_eq!(choose_preferred_port(&available, None), None);
+		assert_eq!(
+			choose_preferred_port(&available, Some("Launch Control XL 3 DAW")),
+			Some(0)
+		);
+	}
+
+	#[test]
+	fn daw_detection_matches_whole_words_only() {
+		assert!(is_daw_port("Launch Control XL 3 DAW"));
+		assert!(is_daw_port("LCXL3 1 DAW In"));
+		assert!(is_daw_port("launch control (daw)"));
+		assert!(is_daw_port("Launch Control XL 3:DAW"));
+		assert!(!is_daw_port("Launch Control XL 3 MIDI"));
+		assert!(!is_daw_port("Dawn Synth"));
+		assert!(!is_daw_port("Shadaw Controller"));
+	}
+
+	#[test]
 	fn auto_detection_is_case_insensitive() {
 		let available = ports(&["iac driver bus 1", "launch control xl 3 midi in"]);
 		assert_eq!(choose_preferred_port(&available, None), Some(1));
@@ -610,20 +726,23 @@ mod tests {
 
 	#[test]
 	fn auto_detection_prefers_physical_ports_over_virtual_ones() {
-		let available = ports(&["Virtual Loopback", "IAC Driver Bus 1", "Arturia KeyStep"]);
-		assert_eq!(choose_preferred_port(&available, None), Some(2));
-
 		let available = ports(&["Virtual Launch Control", "Launch Control XL 3"]);
+		assert_eq!(choose_preferred_port(&available, None), Some(1));
+
+		// A virtual match is still used when it is the only Launch Control port.
+		let available = ports(&["Arturia KeyStep", "Virtual Launch Control"]);
 		assert_eq!(choose_preferred_port(&available, None), Some(1));
 	}
 
 	#[test]
-	fn auto_detection_falls_back_to_the_first_port() {
+	fn auto_detection_never_grabs_unrelated_devices() {
 		let available = ports(&["Virtual Loopback", "IAC Driver Bus 1"]);
-		assert_eq!(choose_preferred_port(&available, None), Some(0));
+		assert_eq!(choose_preferred_port(&available, None), None);
 
-		let available = ports(&["Arturia KeyStep", "Ableton Push"]);
-		assert_eq!(choose_preferred_port(&available, None), Some(0));
+		let available = ports(&["Arturia KeyStep", "Ableton Push", "Audio Interface MIDI"]);
+		assert_eq!(choose_preferred_port(&available, None), None);
+		// Unknown devices stay selectable explicitly.
+		assert_eq!(choose_preferred_port(&available, Some("Audio Interface MIDI")), Some(2));
 	}
 
 	#[test]

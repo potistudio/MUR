@@ -14,6 +14,8 @@
 //! While the exit guard is open every live control behind it is disabled, so a
 //! stray click can never reach the performance (SPEC §9.2).
 
+use std::time::Instant;
+
 use egui::{
 	Align, Align2, Button, Color32, ComboBox, CornerRadius, FontId, Frame, Id, Layout, Margin, Order, Pos2,
 	ProgressBar, Rect, RichText, Sense, Slider, Stroke, StrokeKind, TextStyle, TextureId, Theme, Ui, Vec2, vec2,
@@ -27,9 +29,9 @@ use crate::model::{
 	PlaybackMode,
 };
 
-use super::UiState;
 use super::commands::UiCommand;
 use super::shortcuts::SHORTCUT_LEGEND;
+use super::{REMOVE_CONFIRM_WINDOW, UiState, handle_remove_click, remove_confirmation_armed};
 
 // ------------------------------------------------------------------ palette
 
@@ -183,6 +185,12 @@ pub fn draw_control_ui_in(
 	ui_state.ensure_theme(ui.ctx());
 	let mut out = Vec::new();
 	let live_enabled = !app.exit_confirm_open;
+	let now = Instant::now();
+	// Expired confirmations are dropped before drawing.
+	let mut pending_remove = ui_state
+		.pending_remove_clip
+		.take()
+		.filter(|&(clip_id, armed_at)| remove_confirmation_armed(Some((clip_id, armed_at)), clip_id, now));
 	let state: &UiState = ui_state;
 
 	ui.add_enabled_ui(live_enabled, |ui| {
@@ -200,7 +208,9 @@ pub fn draw_control_ui_in(
 			.default_size(260.0)
 			.min_size(150.0)
 			.frame(library_frame(state.hovered_files > 0))
-			.show(ui, |ui| draw_media_library(ui, app, state, &mut out));
+			.show(ui, |ui| {
+				draw_media_library(ui, app, state, &mut pending_remove, now, &mut out)
+			});
 
 		egui::CentralPanel::default()
 			.frame(Frame::new().fill(BG_PANEL).inner_margin(Margin::same(10)))
@@ -227,6 +237,11 @@ pub fn draw_control_ui_in(
 		draw_exit_modal(&ctx, &mut out);
 	}
 
+	ui_state.pending_remove_clip = pending_remove;
+	if ui_state.pending_remove_clip.is_some() {
+		// Repaint so the armed "×?" reverts once the confirmation window expires.
+		ctx.request_repaint_after(REMOVE_CONFIRM_WINDOW);
+	}
 	out
 }
 
@@ -288,11 +303,16 @@ fn draw_status_bar(ui: &mut Ui, app: &AppState, out: &mut Vec<UiCommand>) {
 /// Output display picker over "Auto / None" plus every discovered monitor.
 fn draw_display_selector(ui: &mut Ui, app: &AppState, out: &mut Vec<UiCommand>) {
 	let selected = app.output.monitor_name.as_deref();
+	// Selections are stored as monitor ids (unique even for identical models);
+	// plain names from older state files or projects still match by name.
+	let is_selected = |monitor: &crate::model::MonitorSummary| {
+		selected.is_some_and(|selected| monitor.id == selected || monitor.name == selected)
+	};
 	let selected_text = match selected {
 		None => "Auto / None".to_owned(),
-		Some(name) => match app.available_monitors.iter().find(|monitor| monitor.name == name) {
+		Some(name) => match app.available_monitors.iter().find(|monitor| is_selected(monitor)) {
 			Some(monitor) => monitor_label(monitor),
-			None => format!("{name} (missing)"),
+			None => format!("{} (missing)", display_name_of(name)),
 		},
 	};
 
@@ -304,12 +324,17 @@ fn draw_display_selector(ui: &mut Ui, app: &AppState, out: &mut Vec<UiCommand>) 
 				out.push(UiCommand::SelectOutputMonitor(None));
 			}
 			for monitor in &app.available_monitors {
-				let is_selected = selected == Some(monitor.name.as_str());
+				let is_selected = is_selected(monitor);
 				if ui.selectable_label(is_selected, monitor_label(monitor)).clicked() && !is_selected {
-					out.push(UiCommand::SelectOutputMonitor(Some(monitor.name.clone())));
+					out.push(UiCommand::SelectOutputMonitor(Some(monitor.id.clone())));
 				}
 			}
 		});
+}
+
+/// Display name part of a stored monitor selection (`name|WxH|x,y[|cg:N]` or a plain name).
+fn display_name_of(selection: &str) -> &str {
+	selection.split('|').next().unwrap_or(selection)
 }
 
 /// Human readable monitor entry, e.g. `DELL (1920×1080) [Primary]`.
@@ -777,7 +802,14 @@ fn library_frame(drop_hover: bool) -> Frame {
 }
 
 /// Header bar plus the scrollable clip grid.
-fn draw_media_library(ui: &mut Ui, app: &AppState, ui_state: &UiState, out: &mut Vec<UiCommand>) {
+fn draw_media_library(
+	ui: &mut Ui,
+	app: &AppState,
+	ui_state: &UiState,
+	pending_remove: &mut Option<(ClipId, Instant)>,
+	now: Instant,
+	out: &mut Vec<UiCommand>,
+) {
 	ui.horizontal(|ui| {
 		section_title(ui, "MEDIA LIBRARY");
 		if ui.button("+ Files").clicked() {
@@ -841,14 +873,26 @@ fn draw_media_library(ui: &mut Ui, app: &AppState, ui_state: &UiState, out: &mut
 			ui.horizontal_wrapped(|ui| {
 				ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
 				for clip in &app.clips {
-					draw_clip_tile(ui, app, ui_state, clip, out);
+					draw_clip_tile(ui, app, ui_state, clip, pending_remove, now, out);
 				}
 			});
 		});
 }
 
 /// One clip tile: thumbnail, badge, name, per-layer triggers, and unload button.
-fn draw_clip_tile(ui: &mut Ui, app: &AppState, ui_state: &UiState, clip: &ClipInfo, out: &mut Vec<UiCommand>) {
+///
+/// Unloading a clip that is live on any layer takes two clicks within
+/// [`REMOVE_CONFIRM_WINDOW`](super::REMOVE_CONFIRM_WINDOW): the first turns "×"
+/// into a warning-colored "×?".
+fn draw_clip_tile(
+	ui: &mut Ui,
+	app: &AppState,
+	ui_state: &UiState,
+	clip: &ClipInfo,
+	pending_remove: &mut Option<(ClipId, Instant)>,
+	now: Instant,
+	out: &mut Vec<UiCommand>,
+) {
 	let focused = app.focused_layer;
 	let selected_on_focus = app.layer(focused).selected_clip == Some(clip.id);
 	let live_layers: Vec<LayerIndex> = LayerIndex::ALL
@@ -912,8 +956,29 @@ fn draw_clip_tile(ui: &mut Ui, app: &AppState, ui_state: &UiState, clip: &ClipIn
 							}
 						}
 						ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-							let remove = Button::new(RichText::new("×").color(DANGER)).min_size(vec2(20.0, 18.0));
-							if ui.add(remove).on_hover_text("Unload clip").clicked() {
+							let is_live = !live_layers.is_empty();
+							let armed = is_live && remove_confirmation_armed(*pending_remove, clip.id, now);
+							let (remove, hint) = if armed {
+								(
+									Button::new(RichText::new("×?").strong().color(BG_DEEP))
+										.fill(WARN)
+										.min_size(vec2(26.0, 18.0)),
+									"Click again to unload live clip",
+								)
+							} else if is_live {
+								(
+									Button::new(RichText::new("×").color(DANGER)).min_size(vec2(20.0, 18.0)),
+									"Unload live clip (click twice)",
+								)
+							} else {
+								(
+									Button::new(RichText::new("×").color(DANGER)).min_size(vec2(20.0, 18.0)),
+									"Unload clip",
+								)
+							};
+							if ui.add(remove).on_hover_text(hint).clicked()
+								&& handle_remove_click(pending_remove, clip.id, is_live, now)
+							{
 								out.push(UiCommand::RemoveClip(clip.id));
 							}
 						});
@@ -1142,6 +1207,12 @@ fn draw_exit_modal(ctx: &egui::Context, out: &mut Vec<UiCommand>) {
 				ui.label(RichText::new("Exit MUR?").strong().size(22.0).color(TEXT));
 				ui.add_space(4.0);
 				ui.label(RichText::new("Live VJ output will stop.").size(15.0).color(WARN));
+				ui.add_space(6.0);
+				ui.label(
+					RichText::new("Press Cmd+Q / Ctrl+Q / Alt+F4 again or click Quit MUR to exit. Esc cancels.")
+						.size(13.0)
+						.color(TEXT_DIM),
+				);
 				ui.add_space(14.0);
 			});
 			ui.columns_const(|columns: &mut [Ui; 2]| {
@@ -1151,14 +1222,9 @@ fn draw_exit_modal(ctx: &egui::Context, out: &mut Vec<UiCommand>) {
 				if cancel_column.add(cancel).clicked() {
 					out.push(UiCommand::CancelExit);
 				}
-				let confirm = Button::new(
-					RichText::new("Confirm Exit (Enter)")
-						.strong()
-						.size(15.0)
-						.color(Color32::WHITE),
-				)
-				.fill(DANGER)
-				.min_size(vec2(confirm_column.available_width(), 36.0));
+				let confirm = Button::new(RichText::new("Quit MUR").strong().size(15.0).color(Color32::WHITE))
+					.fill(DANGER)
+					.min_size(vec2(confirm_column.available_width(), 36.0));
 				if confirm_column.add(confirm).clicked() {
 					out.push(UiCommand::ConfirmExit);
 				}

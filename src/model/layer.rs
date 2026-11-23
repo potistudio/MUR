@@ -15,6 +15,10 @@ pub const MIN_SPEED: f32 = -2.0;
 pub const MAX_SPEED: f32 = 4.0;
 /// Frame rate substituted when a clip reports an unusable fps value.
 pub const DEFAULT_CLIP_FPS: f32 = 60.0;
+/// Slowest clip frame rate accepted from a media container.
+pub const MIN_CLIP_FPS: f32 = 1.0;
+/// Fastest clip frame rate accepted from a media container.
+pub const MAX_CLIP_FPS: f32 = 1000.0;
 /// Lower opacity bound.
 pub const MIN_OPACITY: f32 = 0.0;
 /// Upper opacity bound.
@@ -101,7 +105,8 @@ impl PlaybackMode {
 /// Transport state of a layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum PlaybackState {
-	/// No playhead movement; the last visible frame stays on screen.
+	/// No playhead movement; the layer is hidden from the composite until
+	/// triggered (use `Paused` to freeze a visible frame).
 	#[default]
 	Stopped,
 	/// The playhead advances every frame.
@@ -252,11 +257,15 @@ impl LayerState {
 	}
 
 	/// Binds `clip_id` to the layer and starts playback from its first frame.
+	///
+	/// `fps` values outside [`MIN_CLIP_FPS`]`..=`[`MAX_CLIP_FPS`] (including
+	/// non-finite ones) are replaced with [`DEFAULT_CLIP_FPS`], so a broken
+	/// container cannot make the playhead jump arbitrarily far per frame.
 	pub fn trigger(&mut self, clip_id: ClipId, frame_count: u32, fps: f32) {
 		self.selected_clip = Some(clip_id);
 		self.active_clip = Some(clip_id);
 		self.frame_count = frame_count;
-		self.clip_fps = if fps.is_finite() && fps > 0.0 {
+		self.clip_fps = if fps.is_finite() && (MIN_CLIP_FPS..=MAX_CLIP_FPS).contains(&fps) {
 			fps
 		} else {
 			DEFAULT_CLIP_FPS
@@ -486,6 +495,26 @@ mod tests {
 		assert_eq!(layer.clip_fps, DEFAULT_CLIP_FPS);
 		layer.trigger(ClipId(1), 10, 0.0);
 		assert_eq!(layer.clip_fps, DEFAULT_CLIP_FPS);
+		layer.trigger(ClipId(1), 10, -30.0);
+		assert_eq!(layer.clip_fps, DEFAULT_CLIP_FPS);
+		layer.trigger(ClipId(1), 10, f32::INFINITY);
+		assert_eq!(layer.clip_fps, DEFAULT_CLIP_FPS);
+	}
+
+	#[test]
+	fn trigger_rejects_out_of_range_fps() {
+		// Below MIN_CLIP_FPS, above MAX_CLIP_FPS, and the boundaries themselves.
+		for bad in [1e-5, 0.5, 5000.0, f32::MAX] {
+			let mut layer = LayerState::default();
+			layer.trigger(ClipId(1), 100, bad);
+			assert_eq!(layer.clip_fps, DEFAULT_CLIP_FPS, "{bad}");
+		}
+
+		let mut layer = LayerState::default();
+		layer.trigger(ClipId(1), 100, MIN_CLIP_FPS);
+		assert_eq!(layer.clip_fps, MIN_CLIP_FPS);
+		layer.trigger(ClipId(1), 100, MAX_CLIP_FPS);
+		assert_eq!(layer.clip_fps, MAX_CLIP_FPS);
 	}
 
 	#[test]

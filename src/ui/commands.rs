@@ -598,8 +598,8 @@ fn remove_clip(app: &mut AppState, clip_id: ClipId, outcome: &mut UiApplyOutcome
 
 	if app.clips.len() != before {
 		app.dirty = true;
+		outcome.remove_clip = Some(clip_id);
 	}
-	outcome.remove_clip = Some(clip_id);
 }
 
 #[cfg(test)]
@@ -1096,9 +1096,12 @@ mod tests {
 	#[test]
 	fn remove_unknown_clip_is_harmless() {
 		let mut state = state_with_clips(1);
+		state.dirty = false;
 		let outcome = apply_ui_command(&mut state, &UiCommand::RemoveClip(ClipId(77)));
-		assert_eq!(outcome.remove_clip, Some(ClipId(77)));
+		assert_eq!(outcome.remove_clip, None);
 		assert!(!outcome.any_layer_changed());
+		assert!(outcome.has_no_side_effects());
+		assert!(!state.dirty);
 		assert_eq!(state.clips.len(), 1);
 	}
 

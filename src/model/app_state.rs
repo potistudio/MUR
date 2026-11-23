@@ -263,6 +263,10 @@ impl AppState {
 	}
 
 	/// Toggles pause/resume on `layer`; a stopped layer resumes instead.
+	///
+	/// A layer without an active clip stays stopped and reports `false`, even when
+	/// a clip is merely selected: only `Enter` / a trigger may start playback, so a
+	/// stray pause keystroke cannot silently bring an empty layer to life.
 	pub fn toggle_pause_layer(&mut self, layer: LayerIndex) -> bool {
 		let Some(state) = self.layer_mut(layer) else {
 			return false;
@@ -271,7 +275,7 @@ impl AppState {
 			PlaybackState::Playing => state.playback_state = PlaybackState::Paused,
 			PlaybackState::Paused => state.playback_state = PlaybackState::Playing,
 			PlaybackState::Stopped => {
-				if state.active_clip.is_none() && state.selected_clip.is_none() {
+				if state.active_clip.is_none() {
 					return false;
 				}
 				state.playback_state = PlaybackState::Playing;
@@ -518,6 +522,27 @@ mod tests {
 
 		assert!(state.retrigger_layer(target));
 		assert_eq!(state.layer(target).playhead_frame, 0.0);
+	}
+
+	#[test]
+	fn pause_toggle_ignores_layers_without_an_active_clip() {
+		let mut state = AppState::default();
+		state.upsert_clip(clip(1, ClipStatus::Ready));
+		let target = LayerIndex::ALL[0];
+
+		// Selected but never triggered: pause must not start playback.
+		assert_eq!(state.select_clip_by_index(target, 0), Some(ClipId(1)));
+		assert_eq!(state.layer(target).selected_clip, Some(ClipId(1)));
+		assert!(state.layer(target).active_clip.is_none());
+		assert!(!state.toggle_pause_layer(target));
+		assert_eq!(state.layer(target).playback_state, PlaybackState::Stopped);
+
+		// Once the clip is actually active, the toggle resumes as before.
+		assert!(state.trigger_clip_on_layer(target, ClipId(1)));
+		assert!(state.toggle_pause_layer(target));
+		assert_eq!(state.layer(target).playback_state, PlaybackState::Paused);
+		assert!(state.toggle_pause_layer(target));
+		assert_eq!(state.layer(target).playback_state, PlaybackState::Playing);
 	}
 
 	#[test]

@@ -8,19 +8,26 @@
 //! showing the previous frame (SPEC §8).
 //!
 //! Workers keep their clip's file open, prefetch up to [`PREFETCH_AHEAD`]
-//! frames in the playback direction into a bounded ring buffer, and discard
-//! stale work via a per-layer `generation` counter. I/O, deletion, and decode
-//! errors only stop the affected layer and are reported as
-//! [`LayerStreamEvent::Error`]. A panicking worker is caught with
-//! [`std::panic::catch_unwind`], reported, and restarted.
+//! frames along the playback trajectory into a bounded ring buffer, and discard
+//! stale work via a per-layer `generation` counter. When the exact frame is not
+//! decoded yet, [`LayerStreamer::poll_frame`] serves the nearest buffered frame
+//! of the current generation instead of freezing.
+//!
+//! I/O errors, deletion, and unsupported data stop the affected layer at once
+//! and are reported as [`LayerStreamEvent::Error`]. An isolated corrupt frame is
+//! skipped; only [`MAX_CONSECUTIVE_FRAME_ERRORS`] failures in a row stop the
+//! layer. A panicking worker is caught with [`std::panic::catch_unwind`],
+//! reported, and restarted. Dropping the [`LayerStreamer`] waits at most
+//! [`SHUTDOWN_TIMEOUT`] for the workers, so a worker stuck in slow I/O can
+//! never hang the app on exit.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
@@ -40,6 +47,12 @@ pub const RING_CAPACITY: usize = PREFETCH_AHEAD + 4;
 pub const RENDER_FPS: f32 = 60.0;
 /// Maximum number of undrained events kept before new ones are dropped.
 pub const EVENT_CAPACITY: usize = 256;
+/// Frames just behind the playhead that stay buffered, absorbing tick jitter.
+pub const RETAIN_BEHIND: usize = 2;
+/// Corrupt or undecodable frames in a row that stop a layer's stream.
+pub const MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
+/// Longest time [`LayerStreamer`]'s `Drop` waits for its workers to exit.
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long an idle worker sleeps before re-checking its control block.
 const IDLE_WAIT: Duration = Duration::from_millis(50);
@@ -71,12 +84,17 @@ pub enum LayerStreamEvent {
 	},
 }
 
-/// Computes the frames a layer should hold, nearest first.
+/// Computes the frames a layer should hold, in expected playback order.
 ///
-/// The first entry is always `desired` (clamped to the clip). While playing,
-/// up to `ahead` further frames follow in the playback direction, spaced by the
-/// number of clip frames advanced per output frame at [`RENDER_FPS`]. `Loop`
-/// wraps around both ends; `OneShot` stops at the clip boundaries.
+/// The first entry is always `desired` (clamped to the clip). While playing, up
+/// to `ahead` further frames (at most [`RING_CAPACITY`]` - 1`) follow along the
+/// playback trajectory: with `step` clip frames advanced per output frame at
+/// [`RENDER_FPS`], output frame `k` shows one of the frames `floor(k * step)` or
+/// `ceil(k * step)` after `desired` (depending on the playhead's fractional
+/// phase), so both are included. For `step <= 1` — and any fractional step below
+/// two, such as `1.37` — this yields every consecutive frame; integer steps such
+/// as `4.0` yield exactly the visited frames. `Loop` wraps around both ends;
+/// `OneShot` stops at the clip boundaries.
 pub fn prefetch_window(
 	desired: u32,
 	frame_count: u32,
@@ -90,6 +108,7 @@ pub fn prefetch_window(
 		return Vec::new();
 	};
 	let desired = desired.min(last);
+	let ahead = ahead.min(RING_CAPACITY.saturating_sub(1));
 	let mut window = Vec::with_capacity(ahead.saturating_add(1));
 	window.push(desired);
 	if !is_playing || !speed.is_finite() || speed == 0.0 || frame_count == 1 {
@@ -100,12 +119,70 @@ pub fn prefetch_window(
 	} else {
 		DEFAULT_CLIP_FPS
 	};
-	let step = f64::from((speed.abs() * fps / RENDER_FPS).max(1.0));
+	let step = f64::from(speed.abs() * fps / RENDER_FPS);
 	let direction: i64 = if speed < 0.0 { -1 } else { 1 };
 	let count = i64::from(frame_count);
-	for k in 1..=ahead {
-		let offset = ((k as f64) * step).round() as i64;
+	let limit = ahead.saturating_add(1);
+
+	// Every offset along the trajectory, in playback order; each output frame
+	// contributes `floor(k * step)` and `ceil(k * step)`.
+	let push_offset = |offset: i64, window: &mut Vec<u32>| -> bool {
 		let raw = i64::from(desired).saturating_add(offset.saturating_mul(direction));
+		let frame = match mode {
+			PlaybackMode::Loop => raw.rem_euclid(count),
+			PlaybackMode::OneShot => {
+				if raw < 0 || raw >= count {
+					return false;
+				}
+				raw
+			}
+		};
+		if let Ok(frame) = u32::try_from(frame)
+			&& !window.contains(&frame)
+		{
+			window.push(frame);
+		}
+		true
+	};
+	if step <= 1.0 {
+		for offset in 1..=i64::from(frame_count) {
+			if window.len() >= limit || !push_offset(offset, &mut window) {
+				break;
+			}
+		}
+		return window;
+	}
+	// One trajectory pass over the clip is enough: later offsets only revisit frames.
+	let max_steps = (f64::from(frame_count) / step).ceil() as i64 + 1;
+	'trajectory: for k in 1..=max_steps.max(1) {
+		let position = k as f64 * step;
+		let lower = position.floor();
+		let mut offsets = [lower as i64, lower as i64];
+		if position - lower > TRAJECTORY_EPSILON {
+			offsets[1] = lower as i64 + 1;
+		}
+		for offset in offsets {
+			if window.len() >= limit || !push_offset(offset, &mut window) {
+				break 'trajectory;
+			}
+		}
+	}
+	window
+}
+
+/// Fractional parts below this are treated as an exact integer trajectory step.
+const TRAJECTORY_EPSILON: f64 = 1e-6;
+
+/// Frames just behind `desired` in the playback direction that stay buffered.
+fn behind_frames(desired: u32, frame_count: u32, speed: f32, mode: PlaybackMode) -> Vec<u32> {
+	let mut frames = Vec::with_capacity(RETAIN_BEHIND);
+	if frame_count <= 1 {
+		return frames;
+	}
+	let direction: i64 = if speed < 0.0 { -1 } else { 1 };
+	let count = i64::from(frame_count);
+	for offset in 1..=RETAIN_BEHIND as i64 {
+		let raw = i64::from(desired).saturating_sub(offset.saturating_mul(direction));
 		let frame = match mode {
 			PlaybackMode::Loop => raw.rem_euclid(count),
 			PlaybackMode::OneShot => {
@@ -115,14 +192,33 @@ pub fn prefetch_window(
 				raw
 			}
 		};
-		let Ok(frame) = u32::try_from(frame) else {
-			break;
-		};
-		if !window.contains(&frame) {
-			window.push(frame);
+		if let Ok(frame) = u32::try_from(frame)
+			&& frame != desired
+			&& !frames.contains(&frame)
+		{
+			frames.push(frame);
 		}
 	}
-	window
+	frames
+}
+
+/// Signed distance of `frame` from `desired` in the playback direction.
+///
+/// Positive values lie ahead, negative values behind. `Loop` clips measure the
+/// shorter way around.
+fn playback_offset(frame: u32, desired: u32, frame_count: u32, forward: bool, mode: PlaybackMode) -> i64 {
+	let mut offset = i64::from(frame) - i64::from(desired);
+	if !forward {
+		offset = -offset;
+	}
+	if mode == PlaybackMode::Loop && frame_count > 0 {
+		let count = i64::from(frame_count);
+		offset = offset.rem_euclid(count);
+		if offset > count / 2 {
+			offset -= count;
+		}
+	}
+	offset
 }
 
 // ---------------------------------------------------------------------------
@@ -186,8 +282,15 @@ struct LayerShared {
 	restarts: AtomicU32,
 	/// Generation the worker is currently processing (for panic attribution).
 	active_generation: AtomicU64,
+	/// Set by the supervisor right before the worker thread exits.
+	finished: Mutex<bool>,
+	/// Signalled together with `finished`.
+	finished_cv: Condvar,
 	#[cfg(test)]
 	inject_panic: std::sync::atomic::AtomicBool,
+	/// Number of wake-ups sent to the worker (to verify request deduplication).
+	#[cfg(test)]
+	wakes: AtomicU64,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -206,14 +309,54 @@ impl LayerShared {
 			events,
 			restarts: AtomicU32::new(0),
 			active_generation: AtomicU64::new(0),
+			finished: Mutex::new(false),
+			finished_cv: Condvar::new(),
 			#[cfg(test)]
 			inject_panic: std::sync::atomic::AtomicBool::new(false),
+			#[cfg(test)]
+			wakes: AtomicU64::new(0),
 		}
 	}
 
 	/// Wakes the worker without ever blocking; a pending token is enough.
 	fn wake(&self) {
+		#[cfg(test)]
+		self.wakes.fetch_add(1, Ordering::Relaxed);
 		let _ = self.wake_tx.try_send(());
+	}
+
+	/// Records that the worker thread is about to exit and notifies `Drop`.
+	fn mark_finished(&self) {
+		*lock(&self.finished) = true;
+		self.finished_cv.notify_all();
+	}
+
+	/// Waits until the worker finished or `deadline` passed; returns `true` when finished.
+	fn wait_finished(&self, deadline: Instant) -> bool {
+		let mut finished = lock(&self.finished);
+		while !*finished {
+			let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+				return false;
+			};
+			if remaining.is_zero() {
+				return false;
+			}
+			finished = self
+				.finished_cv
+				.wait_timeout(finished, remaining)
+				.map(|(guard, _)| guard)
+				.unwrap_or_else(|poisoned| poisoned.into_inner().0);
+		}
+		true
+	}
+
+	/// Drops every buffered frame and tags the ring with `generation`.
+	///
+	/// Callers must not hold the `control` lock (lock order stays flat).
+	fn reset_ring(&self, generation: u64) {
+		let mut ring = lock(&self.ring);
+		ring.generation = generation;
+		ring.entries.clear();
 	}
 
 	fn emit(&self, event: LayerStreamEvent) {
@@ -242,16 +385,21 @@ impl LayerShared {
 		});
 	}
 
-	/// Clears the bound clip and bumps the generation.
+	/// Clears the bound clip, bumps the generation, and drops buffered frames at once.
+	///
+	/// After this returns, [`LayerStreamer::poll_frame`] serves nothing from the
+	/// ring for this layer until a new clip is requested.
 	fn clear(&self) {
-		{
+		let generation = {
 			let mut control = lock(&self.control);
 			if control.target.is_some() {
 				control.generation = control.generation.wrapping_add(1);
 			}
 			control.target = None;
 			control.seq = control.seq.wrapping_add(1);
-		}
+			control.generation
+		};
+		self.reset_ring(generation);
 		self.wake();
 	}
 }
@@ -376,24 +524,39 @@ impl LayerStreamer {
 		let Some(shared) = self.layer(layer) else {
 			return false;
 		};
-		let updated_in_place = {
+		let speed = if speed.is_finite() { speed } else { 0.0 };
+		let in_place = {
 			let mut guard = lock(&shared.control);
 			let control = &mut *guard;
 			match control.target.as_mut() {
 				Some(target) if target.clip_id == clip_id => {
-					target.desired_frame = desired_frame.min(target.frame_count.saturating_sub(1));
-					target.speed = if speed.is_finite() { speed } else { 0.0 };
-					target.mode = mode;
-					target.is_playing = is_playing;
-					control.seq = control.seq.wrapping_add(1);
-					true
+					let desired_frame = desired_frame.min(target.frame_count.saturating_sub(1));
+					let unchanged = target.desired_frame == desired_frame
+						&& target.speed.to_bits() == speed.to_bits()
+						&& target.mode == mode
+						&& target.is_playing == is_playing;
+					if unchanged {
+						// Nothing new for the worker: no sequence bump, no wake-up.
+						Some(false)
+					} else {
+						target.desired_frame = desired_frame;
+						target.speed = speed;
+						target.mode = mode;
+						target.is_playing = is_playing;
+						control.seq = control.seq.wrapping_add(1);
+						Some(true)
+					}
 				}
-				_ => false,
+				_ => None,
 			}
 		};
-		if updated_in_place {
-			shared.wake();
-			return true;
+		match in_place {
+			Some(true) => {
+				shared.wake();
+				return true;
+			}
+			Some(false) => return true,
+			None => {}
 		}
 
 		let Some(asset) = self.asset(clip_id) else {
@@ -408,14 +571,14 @@ impl LayerStreamer {
 			}),
 		};
 		let frame_count = asset.frame_count().max(1);
-		{
+		let generation = {
 			let mut control = lock(&shared.control);
 			control.generation = control.generation.wrapping_add(1);
 			control.failed_generation = None;
 			control.target = Some(StreamTarget {
 				clip_id,
 				desired_frame: desired_frame.min(frame_count.saturating_sub(1)),
-				speed: if speed.is_finite() { speed } else { 0.0 },
+				speed,
 				mode,
 				is_playing,
 				frame_count,
@@ -423,7 +586,10 @@ impl LayerStreamer {
 				source,
 			});
 			control.seq = control.seq.wrapping_add(1);
-		}
+			control.generation
+		};
+		// Frames of the previous clip must never be served for the new generation.
+		shared.reset_ring(generation);
 		shared.wake();
 		true
 	}
@@ -435,11 +601,15 @@ impl LayerStreamer {
 		}
 	}
 
-	/// Returns the decoded frame `desired_frame` of `clip_id` if it is ready.
+	/// Returns the decoded frame `desired_frame` of `clip_id`, or the nearest ready one.
 	///
 	/// Never waits for decoding. Frame `0` (and every frame of a still image)
-	/// is served from the resident first frame. `None` means "keep showing the
-	/// previous frame".
+	/// is served from the resident first frame. When the exact frame is not
+	/// decoded yet (decode overload, a skipped corrupt frame), the buffered frame
+	/// of the layer's current generation closest to `desired_frame` is returned,
+	/// preferring frames just behind the playhead over frames ahead of it, within
+	/// [`PREFETCH_AHEAD`] frames. Frames of a cleared or replaced generation are
+	/// never returned. `None` means "keep showing the previous frame".
 	pub fn poll_frame(&self, layer: LayerIndex, clip_id: ClipId, desired_frame: u32) -> Option<Arc<DecodedFrame>> {
 		{
 			let assets = self.assets.read().unwrap_or_else(PoisonError::into_inner);
@@ -449,10 +619,39 @@ impl LayerStreamer {
 			}
 		}
 		let shared = self.layer(layer)?;
+		// Read the control block first and release it before locking the ring, so
+		// the two locks are never nested.
+		let (generation, playback) = {
+			let control = lock(&shared.control);
+			let playback = control
+				.target
+				.as_ref()
+				.filter(|target| target.clip_id == clip_id)
+				.map(|target| (target.frame_count, target.speed >= 0.0, target.mode));
+			(control.generation, playback)
+		};
+		let (frame_count, forward, mode) = playback?;
 		let ring = lock(&shared.ring);
-		ring.entries
+		if ring.generation != generation {
+			return None;
+		}
+		if let Some((_, frame)) = ring
+			.entries
 			.iter()
 			.find(|(id, frame)| *id == clip_id && frame.frame_index == desired_frame)
+		{
+			return Some(Arc::clone(frame));
+		}
+		let max_distance = PREFETCH_AHEAD as i64;
+		ring.entries
+			.iter()
+			.filter(|(id, _)| *id == clip_id)
+			.filter_map(|(_, frame)| {
+				let offset = playback_offset(frame.frame_index, desired_frame, frame_count, forward, mode);
+				// Behind the playhead ranks before ahead at the same distance.
+				(offset != 0 && offset.abs() <= max_distance).then_some(((offset.abs(), offset > 0), frame))
+			})
+			.min_by_key(|(rank, _)| *rank)
 			.map(|(_, frame)| Arc::clone(frame))
 	}
 
@@ -497,14 +696,29 @@ impl LayerStreamer {
 }
 
 impl Drop for LayerStreamer {
+	/// Signals every worker to stop and waits up to [`SHUTDOWN_TIMEOUT`] in total.
+	///
+	/// A worker still blocked in slow I/O after the deadline is detached with a
+	/// warning instead of hanging the caller; it exits on its own once the read
+	/// returns, because the shutdown flag stays set.
 	fn drop(&mut self) {
 		for shared in &self.layers {
 			lock(&shared.control).shutdown = true;
 			shared.wake();
 		}
+		let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
 		let handles = std::mem::take(&mut *lock(&self.handles));
-		for handle in handles {
-			let _ = handle.join();
+		for (shared, handle) in self.layers.iter().zip(handles) {
+			if shared.wait_finished(deadline) {
+				let _ = handle.join();
+			} else {
+				tracing::warn!(
+					layer = %shared.layer,
+					timeout_ms = SHUTDOWN_TIMEOUT.as_millis() as u64,
+					"decode worker did not stop in time; detaching it"
+				);
+				drop(handle);
+			}
 		}
 	}
 }
@@ -513,8 +727,14 @@ impl Drop for LayerStreamer {
 // Worker
 // ---------------------------------------------------------------------------
 
-/// Restarts `worker_main` after panics until shutdown.
+/// Runs [`supervise_loop`] and reports the thread's exit to `Drop`.
 fn supervise(shared: &LayerShared) {
+	supervise_loop(shared);
+	shared.mark_finished();
+}
+
+/// Restarts `worker_main` after panics until shutdown.
+fn supervise_loop(shared: &LayerShared) {
 	let mut backoff = RESTART_BACKOFF;
 	loop {
 		let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker_main(shared)));
@@ -622,7 +842,11 @@ fn worker_main(shared: &LayerShared) {
 	let mut applied_seq: Option<u64> = None;
 	let mut open: Option<OpenClip> = None;
 	let mut window: Vec<u32> = Vec::new();
+	let mut retained: Vec<u32> = Vec::new();
 	let mut scratch: Vec<u8> = Vec::new();
+	// Frames of this generation that failed to decode; skipped instead of retried.
+	let mut skipped: HashSet<u32> = HashSet::new();
+	let mut consecutive_decode_errors: u32 = 0;
 
 	loop {
 		let Some(snapshot) = take_snapshot(shared, generation) else {
@@ -635,11 +859,10 @@ fn worker_main(shared: &LayerShared) {
 			applied_seq = None;
 			open = None;
 			window.clear();
-			{
-				let mut ring = lock(&shared.ring);
-				ring.generation = snapshot.generation;
-				ring.entries.clear();
-			}
+			retained.clear();
+			skipped.clear();
+			consecutive_decode_errors = 0;
+			shared.reset_ring(snapshot.generation);
 			if let (Some(source), Some(target), false) = (snapshot.source, snapshot.target, snapshot.failed) {
 				match File::open(&source.path) {
 					Ok(file) => {
@@ -667,20 +890,26 @@ fn worker_main(shared: &LayerShared) {
 
 		if applied_seq != Some(snapshot.seq) {
 			applied_seq = Some(snapshot.seq);
-			window = match snapshot.target {
-				Some(target) if open.is_some() => prefetch_window(
-					target.desired_frame,
-					target.frame_count,
-					target.speed,
-					target.fps,
-					target.mode,
-					target.is_playing,
-					PREFETCH_AHEAD,
+			(window, retained) = match snapshot.target {
+				Some(target) if open.is_some() => (
+					prefetch_window(
+						target.desired_frame,
+						target.frame_count,
+						target.speed,
+						target.fps,
+						target.mode,
+						target.is_playing,
+						PREFETCH_AHEAD,
+					),
+					behind_frames(target.desired_frame, target.frame_count, target.speed, target.mode),
 				),
-				_ => Vec::new(),
+				_ => (Vec::new(), Vec::new()),
 			};
+			// Keep the window plus the frames just behind the playhead, so tick
+			// jitter never evicts a freshly decoded frame that is still on screen.
 			let mut ring = lock(&shared.ring);
-			ring.entries.retain(|(_, frame)| window.contains(&frame.frame_index));
+			ring.entries
+				.retain(|(_, frame)| window.contains(&frame.frame_index) || retained.contains(&frame.frame_index));
 		}
 
 		let next = match &open {
@@ -689,7 +918,7 @@ fn worker_main(shared: &LayerShared) {
 				window
 					.iter()
 					.copied()
-					.find(|&frame| frame != 0 && !ring.contains(clip.clip_id, frame))
+					.find(|&frame| frame != 0 && !skipped.contains(&frame) && !ring.contains(clip.clip_id, frame))
 			}
 			None => None,
 		};
@@ -707,23 +936,65 @@ fn worker_main(shared: &LayerShared) {
 		}
 
 		let current_generation = snapshot.generation;
+		let frame_count = snapshot.target.map_or(0, |target| target.frame_count);
 		match decode_frame(clip, frame_index, &mut scratch) {
 			Ok(frame) => {
+				consecutive_decode_errors = 0;
 				let mut ring = lock(&shared.ring);
 				if ring.generation == current_generation {
 					while ring.entries.len() >= RING_CAPACITY {
-						ring.entries.pop_front();
+						// Evict frames outside the window first, oldest first.
+						let stale = ring
+							.entries
+							.iter()
+							.position(|(_, buffered)| !window.contains(&buffered.frame_index));
+						match stale {
+							Some(position) => {
+								let _ = ring.entries.remove(position);
+							}
+							None => {
+								let _ = ring.entries.pop_front();
+							}
+						}
 					}
 					ring.entries.push_back((clip.clip_id, Arc::new(frame)));
 				}
 			}
 			Err(error) => {
+				consecutive_decode_errors = consecutive_decode_errors.saturating_add(1);
 				let message = format!("{}: {error}", clip.path.display());
 				let clip_id = clip.clip_id;
-				open = None;
-				shared.report_error(clip_id, current_generation, message);
+				if is_fatal_stream_error(&error, frame_count, consecutive_decode_errors) {
+					open = None;
+					shared.report_error(clip_id, current_generation, message);
+				} else {
+					tracing::warn!(
+						layer = %shared.layer,
+						clip = clip_id.0,
+						frame_index,
+						consecutive = consecutive_decode_errors,
+						%message,
+						"skipping undecodable frame"
+					);
+					skipped.insert(frame_index);
+				}
 			}
 		}
+	}
+}
+
+/// Returns `true` when `error` must stop the layer's stream for this generation.
+///
+/// I/O failures (deleted or truncated file, unplugged drive), unsupported data,
+/// and failures of single-frame clips stop the stream at once. Corrupt or
+/// undecodable frames of a multi-frame clip are skipped until
+/// [`MAX_CONSECUTIVE_FRAME_ERRORS`] of them fail in a row.
+fn is_fatal_stream_error(error: &MediaError, frame_count: u32, consecutive: u32) -> bool {
+	match error {
+		MediaError::Corrupt { .. } | MediaError::Decode { .. } => {
+			frame_count <= 1 || consecutive >= MAX_CONSECUTIVE_FRAME_ERRORS
+		}
+		MediaError::Io { .. } | MediaError::UnsupportedFormat(_) | MediaError::WorkerStopped(_) => true,
 	}
 }
 
@@ -811,6 +1082,51 @@ mod tests {
 			prefetch_window(2, 10, -1.0, 60.0, PlaybackMode::OneShot, true, 12),
 			[2, 1, 0]
 		);
+	}
+
+	#[test]
+	fn window_covers_fractional_fast_trajectories() {
+		// 1.37 clip frames per output frame: every consecutive frame is needed.
+		let window = prefetch_window(0, 100, 1.37, 60.0, PlaybackMode::Loop, true, 12);
+		assert_eq!(window, (0..=12).collect::<Vec<u32>>());
+		let reverse = prefetch_window(20, 100, -1.37, 60.0, PlaybackMode::Loop, true, 5);
+		assert_eq!(reverse, [20, 19, 18, 17, 16, 15]);
+		// 2.5 frames per output frame: floor and ceil of each visited position.
+		let window = prefetch_window(0, 100, 2.5, 60.0, PlaybackMode::Loop, true, 6);
+		assert_eq!(window, [0, 2, 3, 5, 7, 8, 10]);
+		// Every frame a playhead can land on is part of the window.
+		for phase in [0.0, 0.25, 0.5, 0.99] {
+			let window = prefetch_window(10, 1000, 1.37, 60.0, PlaybackMode::Loop, true, 12);
+			for tick in 1..=6 {
+				let frame = (10.0 + phase + f64::from(tick) * 1.37).floor() as u32;
+				assert!(window.contains(&frame), "phase {phase} tick {tick} frame {frame}");
+			}
+		}
+		// The window never exceeds the ring.
+		assert_eq!(
+			prefetch_window(0, 1000, 1.0, 60.0, PlaybackMode::Loop, true, 100).len(),
+			RING_CAPACITY
+		);
+		// One-shot stops at the end even on a fractional trajectory.
+		assert_eq!(
+			prefetch_window(95, 100, 2.5, 60.0, PlaybackMode::OneShot, true, 12),
+			[95, 97, 98]
+		);
+	}
+
+	#[test]
+	fn behind_frames_and_offsets_follow_direction() {
+		assert_eq!(behind_frames(5, 10, 1.0, PlaybackMode::Loop), [4, 3]);
+		assert_eq!(behind_frames(5, 10, -1.0, PlaybackMode::Loop), [6, 7]);
+		assert_eq!(behind_frames(0, 10, 1.0, PlaybackMode::Loop), [9, 8]);
+		assert_eq!(behind_frames(0, 10, 1.0, PlaybackMode::OneShot), Vec::<u32>::new());
+		assert_eq!(behind_frames(0, 1, 1.0, PlaybackMode::Loop), Vec::<u32>::new());
+
+		assert_eq!(playback_offset(4, 5, 10, true, PlaybackMode::Loop), -1);
+		assert_eq!(playback_offset(6, 5, 10, false, PlaybackMode::Loop), -1);
+		assert_eq!(playback_offset(9, 0, 10, true, PlaybackMode::Loop), -1);
+		assert_eq!(playback_offset(1, 9, 10, true, PlaybackMode::Loop), 2);
+		assert_eq!(playback_offset(1, 9, 10, true, PlaybackMode::OneShot), -8);
 	}
 
 	#[test]
@@ -1081,36 +1397,201 @@ mod tests {
 		)));
 	}
 
-	#[test]
-	fn corrupt_frame_reports_decode_error() {
-		let dir = TempDir::new("stream_corrupt").unwrap();
-		let streamer = LayerStreamer::new().unwrap();
-		let (asset, _) = hap_clip(dir.path(), "a.mov", 1, 10);
+	fn corrupt_samples(asset: &ClipAsset, frames: impl IntoIterator<Item = usize>) {
 		let ClipBacking::HapMov { index, path } = &asset.backing else {
 			panic!("expected HAP backing");
 		};
-		let sample = index.samples[4];
 		let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-		file.seek(SeekFrom::Start(sample.offset)).unwrap();
-		file.write_all(&vec![0xEE; sample.size as usize]).unwrap();
-		drop(file);
+		for frame in frames {
+			let sample = index.samples[frame];
+			file.seek(SeekFrom::Start(sample.offset)).unwrap();
+			file.write_all(&vec![0xEE; sample.size as usize]).unwrap();
+		}
+	}
+
+	#[test]
+	fn isolated_corrupt_frame_is_skipped_without_stopping_the_stream() {
+		let dir = TempDir::new("stream_corrupt").unwrap();
+		let streamer = LayerStreamer::new().unwrap();
+		let (asset, fixture) = hap_clip(dir.path(), "a.mov", 1, 10);
+		corrupt_samples(&asset, [4]);
 		streamer.register_asset(asset);
 
+		streamer.request_layer_state(L1, ClipId(1), 1, 1.0, PlaybackMode::Loop, true);
+		// Frames on both sides of the corrupt one decode normally.
+		assert!(wait_until(|| {
+			let buffered = streamer.buffered_frames(L1);
+			[1, 2, 3, 5, 6, 7, 8, 9].iter().all(|frame| buffered.contains(frame))
+		}));
+		assert!(!streamer.buffered_frames(L1).contains(&4));
+		std::thread::sleep(Duration::from_millis(30));
+		assert!(
+			streamer.drain_events().is_empty(),
+			"one corrupt frame must not stop the layer"
+		);
+
+		// Reaching the corrupt frame serves the nearest frame instead of freezing.
+		streamer.request_layer_state(L1, ClipId(1), 4, 1.0, PlaybackMode::Loop, true);
+		let fallback = streamer.poll_frame(L1, ClipId(1), 4).unwrap();
+		assert_eq!(fallback.frame_index, 3, "prefers the frame just behind the playhead");
+		let next = streamer.poll_frame(L1, ClipId(1), 5).unwrap();
+		assert_eq!(payload_bytes(&next), fixture.frame_payload(5).unwrap().as_slice());
+		assert!(streamer.drain_events().is_empty());
+	}
+
+	#[test]
+	fn consecutive_corrupt_frames_stop_the_layer() {
+		let dir = TempDir::new("stream_corrupt_run").unwrap();
+		let streamer = LayerStreamer::new().unwrap();
+		let (asset, _) = hap_clip(dir.path(), "a.mov", 1, 20);
+		corrupt_samples(&asset, 1..20);
+		streamer.register_asset(asset);
 		streamer.request_layer_state(L1, ClipId(1), 1, 1.0, PlaybackMode::Loop, true);
 		let mut events = Vec::new();
 		assert!(wait_until(|| {
 			events.extend(streamer.drain_events());
 			!events.is_empty()
 		}));
-		assert!(matches!(&events[0], LayerStreamEvent::Error { layer, .. } if *layer == L1));
-		// Frames decoded before the corrupt one remain available.
-		assert!(streamer.poll_frame(L1, ClipId(1), 1).is_some());
-		assert!(streamer.poll_frame(L1, ClipId(1), 4).is_none());
+		assert!(matches!(&events[0], LayerStreamEvent::Error { layer, clip_id: ClipId(1), .. } if *layer == L1));
+		assert!(streamer.buffered_frames(L1).is_empty());
 
-		// Retrying after a clear starts a fresh generation.
+		// Retrying after a clear starts a fresh generation (and fails again cleanly).
 		streamer.clear_layer(L1);
-		streamer.request_layer_state(L1, ClipId(1), 2, 1.0, PlaybackMode::Loop, false);
-		assert!(wait_until(|| streamer.poll_frame(L1, ClipId(1), 2).is_some()));
+		assert!(streamer.request_layer_state(L1, ClipId(1), 2, 1.0, PlaybackMode::Loop, false));
+		assert!(
+			streamer.poll_frame(L1, ClipId(1), 0).is_some(),
+			"resident frame 0 stays available"
+		);
+	}
+
+	#[test]
+	fn fatal_error_classification() {
+		let io = MediaError::Io {
+			path: "a.mov".into(),
+			source: std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+		};
+		let corrupt = MediaError::Corrupt {
+			path: "a.mov".into(),
+			detail: "bad".into(),
+		};
+		let decode = MediaError::Decode {
+			frame_index: 3,
+			detail: "bad".into(),
+		};
+		assert!(is_fatal_stream_error(&io, 100, 1));
+		assert!(is_fatal_stream_error(
+			&MediaError::UnsupportedFormat("x".into()),
+			100,
+			1
+		));
+		assert!(!is_fatal_stream_error(&corrupt, 100, 1));
+		assert!(!is_fatal_stream_error(&decode, 100, MAX_CONSECUTIVE_FRAME_ERRORS - 1));
+		assert!(is_fatal_stream_error(&decode, 100, MAX_CONSECUTIVE_FRAME_ERRORS));
+		assert!(is_fatal_stream_error(&decode, 1, 1), "single-frame clips fail at once");
+	}
+
+	#[test]
+	fn unchanged_request_does_not_wake_the_worker() {
+		let dir = TempDir::new("stream_dedupe").unwrap();
+		let streamer = LayerStreamer::new().unwrap();
+		let (asset, _) = hap_clip(dir.path(), "a.mov", 1, 20);
+		streamer.register_asset(asset);
+		assert!(streamer.request_layer_state(L1, ClipId(1), 3, 1.0, PlaybackMode::Loop, true));
+		let shared = streamer.layer(L1).unwrap();
+		let seq = lock(&shared.control).seq;
+		let wakes = shared.wakes.load(Ordering::Relaxed);
+		let generation = streamer.layer_generation(L1).unwrap();
+		for _ in 0..100 {
+			assert!(streamer.request_layer_state(L1, ClipId(1), 3, 1.0, PlaybackMode::Loop, true));
+		}
+		assert_eq!(lock(&shared.control).seq, seq);
+		assert_eq!(shared.wakes.load(Ordering::Relaxed), wakes);
+		assert_eq!(streamer.layer_generation(L1).unwrap(), generation);
+
+		// Any real change still reaches the worker without a generation bump.
+		assert!(streamer.request_layer_state(L1, ClipId(1), 4, 1.0, PlaybackMode::Loop, true));
+		assert_eq!(lock(&shared.control).seq, seq.wrapping_add(1));
+		assert_eq!(shared.wakes.load(Ordering::Relaxed), wakes + 1);
+		assert!(streamer.request_layer_state(L1, ClipId(1), 4, -1.0, PlaybackMode::Loop, true));
+		assert!(streamer.request_layer_state(L1, ClipId(1), 4, -1.0, PlaybackMode::OneShot, true));
+		assert!(streamer.request_layer_state(L1, ClipId(1), 4, -1.0, PlaybackMode::OneShot, false));
+		assert_eq!(lock(&shared.control).seq, seq.wrapping_add(4));
+		assert_eq!(streamer.layer_generation(L1).unwrap(), generation);
+	}
+
+	#[test]
+	fn clear_layer_hides_buffered_frames_immediately() {
+		let dir = TempDir::new("stream_clear").unwrap();
+		let streamer = LayerStreamer::new().unwrap();
+		let (asset, _) = hap_clip(dir.path(), "a.mov", 1, 20);
+		streamer.register_asset(asset);
+		streamer.request_layer_state(L1, ClipId(1), 3, 1.0, PlaybackMode::Loop, true);
+		assert!(wait_until(|| streamer.poll_frame(L1, ClipId(1), 3).is_some()));
+		streamer.clear_layer(L1);
+		// No waiting for the worker: the ring is emptied by `clear_layer` itself.
+		assert!(streamer.poll_frame(L1, ClipId(1), 3).is_none());
+		assert!(streamer.poll_frame(L1, ClipId(1), 4).is_none());
+		assert!(streamer.buffered_frames(L1).is_empty());
+	}
+
+	#[test]
+	fn switching_clips_never_serves_the_previous_clip() {
+		let dir = TempDir::new("stream_switch").unwrap();
+		let streamer = LayerStreamer::new().unwrap();
+		let (a, _) = hap_clip(dir.path(), "a.mov", 1, 20);
+		let (b, _) = hap_clip(dir.path(), "b.mov", 2, 20);
+		streamer.register_asset(a);
+		streamer.register_asset(b);
+		streamer.request_layer_state(L1, ClipId(1), 3, 1.0, PlaybackMode::Loop, true);
+		assert!(wait_until(|| streamer.poll_frame(L1, ClipId(1), 3).is_some()));
+		streamer.request_layer_state(L1, ClipId(2), 3, 1.0, PlaybackMode::Loop, true);
+		assert!(streamer.poll_frame(L1, ClipId(1), 3).is_none());
+	}
+
+	#[test]
+	fn fractional_fast_speed_prefetches_every_visited_frame() {
+		let dir = TempDir::new("stream_fractional").unwrap();
+		let streamer = LayerStreamer::new().unwrap();
+		let (asset, fixture) = hap_clip(dir.path(), "a.mov", 1, 120);
+		streamer.register_asset(asset);
+		// 30 fps clip at 2.74x on a 60 fps output: 1.37 clip frames per output frame.
+		let speed = 2.74_f32;
+		let step = f64::from(speed) * 30.0 / f64::from(RENDER_FPS);
+		let playhead = |tick: u32| 1.0 + f64::from(tick) * step;
+		for tick in 0..40 {
+			let desired = playhead(tick).floor() as u32;
+			let next = playhead(tick + 1).floor() as u32;
+			assert!(streamer.request_layer_state(L1, ClipId(1), desired, speed, PlaybackMode::Loop, true));
+			assert!(wait_until(|| streamer.poll_frame(L1, ClipId(1), desired).is_some()));
+			let frame = streamer.poll_frame(L1, ClipId(1), desired).unwrap();
+			assert_eq!(frame.frame_index, desired);
+			assert_eq!(
+				payload_bytes(&frame),
+				fixture.frame_payload(desired).unwrap().as_slice()
+			);
+			// The next visited frame was prefetched before it is requested.
+			assert!(
+				wait_until(|| streamer.buffered_frames(L1).contains(&next)),
+				"frame {next} after {desired} was not prefetched"
+			);
+		}
+		assert!(streamer.drain_events().is_empty());
+	}
+
+	#[test]
+	fn shutdown_wait_is_bounded() {
+		let (events, _rx) = crossbeam_channel::bounded(1);
+		let shared = LayerShared::new(L1, events);
+		let started = Instant::now();
+		assert!(!shared.wait_finished(started + Duration::from_millis(30)));
+		assert!(started.elapsed() >= Duration::from_millis(25));
+		shared.mark_finished();
+		assert!(shared.wait_finished(Instant::now()));
+
+		let streamer = LayerStreamer::new().unwrap();
+		let dropped = Instant::now();
+		drop(streamer);
+		assert!(dropped.elapsed() < SHUTDOWN_TIMEOUT);
 	}
 
 	#[test]

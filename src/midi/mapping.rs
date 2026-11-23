@@ -16,7 +16,7 @@
 //! | Buttons Row 1 (1–4) | Note | `36`–`39` | Layer 1–4 trigger / retrigger |
 //! | Buttons Row 2 (9–12) | Note | `44`–`47` | Layer 1–4 pause / resume toggle |
 //! | Buttons Row 1 (5–8) | Note | `40`–`43` | RGB shift, glitch, strobe, blackout toggles |
-//! | Buttons Row 2 (13–16) | Note | `48`–`51` | Effect reset, quick fire, focused playback mode, speed reset |
+//! | Buttons Row 2 (13–16) | Note | `48`–`51` | Effect reset, retrigger all active layers, focused playback mode, speed reset |
 //! | Reserved | CC | `25`–`28`, `35`–`38` | Unassigned |
 
 use crate::model::effect::{cc_to_brightness, cc_to_factor_centered, cc_to_strobe_hz, cc_to_unit};
@@ -104,6 +104,12 @@ pub enum MidiAction {
 }
 
 /// Decodes one raw MIDI message into a [`MidiAction`].
+///
+/// `bytes` is expected to hold exactly one complete MIDI message as delivered by
+/// a `midir` input callback (for example `[0xB0, 1, 64]`). Concatenated packets
+/// and running-status streams are not decoded: only the first three bytes are
+/// read, so callers must split multi-message buffers before calling this
+/// function.
 ///
 /// The function is deliberately total: short packets, System messages, wrong
 /// channels, Note Off messages, and unassigned controller numbers all yield
