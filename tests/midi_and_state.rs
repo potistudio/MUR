@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use mur::config::{PersistedState, ProjectConfig, STATE_VERSION, load_state, save_state_atomic};
+use mur::config::{PersistedLayerState, PersistedState, ProjectConfig, STATE_VERSION, load_state, save_state_atomic};
 use mur::media::test_fixtures::TempDir;
 use mur::midi::{MidiAction, apply_midi_action, parse_midi_message, resolve_clip_index};
 use mur::model::effect::{cc_to_brightness, cc_to_factor_centered, cc_to_strobe_hz, cc_to_unit};
@@ -30,6 +30,10 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
 fn approx(actual: f32, expected: f32) {
 	assert!((actual - expected).abs() < 1e-5, "expected {expected}, got {actual}");
+}
+
+fn approx_f64(actual: f64, expected: f64) {
+	assert!((actual - expected).abs() < 1e-9, "expected {expected}, got {actual}");
 }
 
 fn clip(id: u64, path: &Path) -> ClipInfo {
@@ -105,7 +109,7 @@ fn layer(number: u8) -> LayerIndex {
 #[test]
 fn launch_control_layer_ccs_cover_every_band() {
 	let mut app = state_with_clips(6);
-	let blur = BlendMode::ALL;
+	let all_modes = BlendMode::ALL;
 	let blend_values = [0_u8, 25, 26, 51, 52, 76, 77, 102, 103, 127];
 	let mut seen_blend = Vec::new();
 
@@ -178,7 +182,7 @@ fn launch_control_layer_ccs_cover_every_band() {
 		}
 	}
 
-	for mode in blur {
+	for mode in all_modes {
 		assert!(seen_blend.contains(&mode), "{mode:?} was never reachable from CC");
 	}
 }
@@ -780,10 +784,19 @@ fn keyboard_fallback_drives_master_effects_output_and_overlays() {
 	assert_eq!(command, Some(UiCommand::ToggleShortcutsOverlay));
 	apply_key(&mut app, command);
 	assert!(app.show_shortcuts);
-	let command = by_char("?", KeyCode::KeyH, ModifiersState::empty(), focused);
+	// `?` is the shifted `/` key on a real US keyboard, not a bare `h`.
+	let command = by_char("?", KeyCode::Slash, ModifiersState::SHIFT, focused);
 	assert_eq!(command, Some(UiCommand::ToggleShortcutsOverlay));
 	apply_key(&mut app, command);
 	assert!(!app.show_shortcuts);
+	// `~` is Shift + `` ` ``; the backquote alias keeps the blackout reachable on
+	// layouts where the physical key prints `~`.
+	let command = by_char("~", KeyCode::Backquote, ModifiersState::SHIFT, focused);
+	assert_eq!(command, Some(UiCommand::ToggleBlackout));
+	apply_key(&mut app, command);
+	assert!(app.effects.blackout);
+	apply_key(&mut app, Some(UiCommand::ToggleBlackout));
+	assert!(!app.effects.blackout);
 	let command = by_char("g", KeyCode::KeyG, ModifiersState::empty(), focused);
 	assert_eq!(command, Some(UiCommand::ToggleLogsDrawer));
 	apply_key(&mut app, command);
@@ -797,16 +810,24 @@ fn keyboard_fallback_drives_master_effects_output_and_overlays() {
 }
 
 #[test]
-fn exit_guard_swallows_every_key_and_honours_egui_focus() {
+fn exit_guard_accepts_only_its_own_answers() {
 	let mut app = AppState::default();
 	let focused = app.focused_layer;
 
-	// Cmd+Q opens the guard but never quits.
-	let command = by_char("q", KeyCode::KeyQ, ModifiersState::SUPER, focused);
+	// Ctrl+Q (H1 on Windows/Linux) opens the guard but never quits.
+	let command = by_char("q", KeyCode::KeyQ, ModifiersState::CONTROL, focused);
 	assert_eq!(command, Some(UiCommand::RequestExit));
 	let outcome = apply_key(&mut app, command);
 	assert!(outcome.exit_requested);
 	assert!(!outcome.confirm_quit);
+	assert!(app.exit_confirm_open);
+
+	// Cmd+Q (Claude M5 on macOS) does exactly the same.
+	apply_key(&mut app, Some(UiCommand::CancelExit));
+	assert!(!app.exit_confirm_open);
+	let command = by_char("q", KeyCode::KeyQ, ModifiersState::SUPER, focused);
+	assert_eq!(command, Some(UiCommand::RequestExit));
+	apply_key(&mut app, command);
 	assert!(app.exit_confirm_open);
 
 	// While the guard is open every other key is swallowed, even when egui
@@ -830,15 +851,23 @@ fn exit_guard_swallows_every_key_and_honours_egui_focus() {
 	);
 	assert_eq!(swallowed_digit, None);
 
-	let confirm = map_key_event(
-		&Key::Named(NamedKey::Enter),
-		PhysicalKey::Code(KeyCode::Enter),
-		ModifiersState::empty(),
-		focused,
-		true,
-		true,
-	);
-	assert_eq!(confirm, Some(UiCommand::ConfirmExit));
+	// Enter is the most common live trigger and must never confirm the guard.
+	for (key, code) in [
+		(Key::Named(NamedKey::Enter), KeyCode::Enter),
+		(Key::Named(NamedKey::Enter), KeyCode::NumpadEnter),
+	] {
+		let swallowed = map_key_event(
+			&key,
+			PhysicalKey::Code(code),
+			ModifiersState::empty(),
+			focused,
+			true,
+			true,
+		);
+		assert_eq!(swallowed, None, "{code:?} must be swallowed while the guard is open");
+	}
+
+	// Escape cancels without quitting.
 	let cancel = map_key_event(
 		&Key::Named(NamedKey::Escape),
 		PhysicalKey::Code(KeyCode::Escape),
@@ -849,6 +878,16 @@ fn exit_guard_swallows_every_key_and_honours_egui_focus() {
 	);
 	assert_eq!(cancel, Some(UiCommand::CancelExit));
 
+	// Repeating a quit gesture is the only way to confirm the exit.
+	for (key, code, mods) in [
+		(Key::Character("q".into()), KeyCode::KeyQ, ModifiersState::SUPER),
+		(Key::Character("q".into()), KeyCode::KeyQ, ModifiersState::CONTROL),
+		(Key::Named(NamedKey::F4), KeyCode::F4, ModifiersState::ALT),
+	] {
+		let confirm = map_key_event(&key, PhysicalKey::Code(code), mods, focused, true, false);
+		assert_eq!(confirm, Some(UiCommand::ConfirmExit), "{code:?} must confirm the guard");
+	}
+
 	// Cancel keeps the show running and restores normal mapping.
 	let outcome = apply_key(&mut app, cancel);
 	assert!(!outcome.confirm_quit);
@@ -858,14 +897,14 @@ fn exit_guard_swallows_every_key_and_honours_egui_focus() {
 	assert_eq!(command, Some(UiCommand::ClearLayer(focused)));
 
 	// Confirming leaves the guard closed and requests the actual quit.
-	apply_key(&mut app, by_char("q", KeyCode::KeyQ, ModifiersState::SUPER, focused));
+	apply_key(&mut app, by_char("q", KeyCode::KeyQ, ModifiersState::CONTROL, focused));
 	assert!(app.exit_confirm_open);
 	let outcome = apply_key(
 		&mut app,
 		map_key_event(
-			&Key::Named(NamedKey::Enter),
-			PhysicalKey::Code(KeyCode::Enter),
-			ModifiersState::empty(),
+			&Key::Character("q".into()),
+			PhysicalKey::Code(KeyCode::KeyQ),
+			ModifiersState::SUPER,
 			focused,
 			true,
 			false,
@@ -1041,7 +1080,7 @@ fn persisted_state_round_trips_atomically_and_restores_stopped_layers() {
 		.unwrap()
 		.filter_map(Result::ok)
 		.map(|entry| entry.file_name().to_string_lossy().into_owned())
-		.filter(|name| name.ends_with(".tmp"))
+		.filter(|name| name.contains(".tmp"))
 		.collect();
 	assert!(leftovers.is_empty(), "atomic save left temporary files: {leftovers:?}");
 
@@ -1075,11 +1114,17 @@ fn persisted_state_round_trips_atomically_and_restores_stopped_layers() {
 			PlaybackState::Stopped,
 			"restored layers must never start moving on their own (SPEC §6.2/§8)"
 		);
-		assert_eq!(layer.playhead_frame, 0.0);
+		// The playhead itself is preserved: the operator returns to the frame they
+		// left, only the transport stays stopped until they press play.
+		approx_f64(layer.playhead_frame, persisted.playhead_frame);
 		assert_eq!(layer.playback_mode, persisted.playback_mode);
 		assert_eq!(layer.blend_mode, persisted.blend_mode);
 		approx(layer.speed, persisted.speed);
 		approx(layer.opacity, persisted.opacity);
+		assert!(
+			persisted.playhead_frame > 0.0,
+			"`advance_layers(0.3)` must have moved every layer off frame 0"
+		);
 		let clip_id = layer.active_clip.expect("each layer had a persisted clip");
 		let path = restored.clip_by_id(clip_id).unwrap().path.clone();
 		assert_eq!(Some(path), persisted.clip_path);
@@ -1115,4 +1160,310 @@ fn persisted_state_round_trips_atomically_and_restores_stopped_layers() {
 	let future = dir.path().join("future.json");
 	std::fs::write(&future, format!(r#"{{"version":{}}}"#, STATE_VERSION + 1)).unwrap();
 	assert!(load_state(&future).unwrap().is_none());
+}
+
+#[test]
+fn state_files_tolerate_one_three_and_five_layer_entries() {
+	let dir = TempDir::new("lenient_layers").unwrap();
+
+	// One layer entry: the rest is padded with defaults, and the missing
+	// `effects` block falls back to the neutral master chain.
+	let one = dir.path().join("one.json");
+	std::fs::write(
+		&one,
+		r#"{"version":1,"layers":[{"opacity":0.25,"blend_mode":"Screen"}]}"#,
+	)
+	.unwrap();
+	let loaded = load_state(&one).unwrap().unwrap();
+	assert_eq!(loaded.version, STATE_VERSION);
+	approx(loaded.layers[0].opacity, 0.25);
+	assert_eq!(loaded.layers[0].blend_mode, BlendMode::Screen);
+	for layer in &loaded.layers[1..] {
+		assert_eq!(*layer, PersistedLayerState::default());
+	}
+	assert_eq!(loaded.effects, MasterEffects::default());
+	assert!(loaded.clip_paths.is_empty());
+	assert_eq!(loaded.focused_layer, 1);
+
+	// Three entries with a partial effects block.
+	let three = dir.path().join("three.json");
+	std::fs::write(
+		&three,
+		r#"{
+			"version": 1,
+			"layers": [
+				{"opacity": 0.11},
+				{"opacity": 0.22, "speed": 2.0},
+				{"opacity": 0.33, "playback_mode": "OneShot"}
+			],
+			"effects": {"master_dimmer": 0.5}
+		}"#,
+	)
+	.unwrap();
+	let loaded = load_state(&three).unwrap().unwrap();
+	approx(loaded.layers[0].opacity, 0.11);
+	approx(loaded.layers[1].opacity, 0.22);
+	approx(loaded.layers[1].speed, 2.0);
+	approx(loaded.layers[2].opacity, 0.33);
+	assert_eq!(loaded.layers[2].playback_mode, PlaybackMode::OneShot);
+	assert_eq!(loaded.layers[3], PersistedLayerState::default());
+	approx(loaded.effects.master_dimmer, 0.5);
+	approx(loaded.effects.contrast, 1.0);
+
+	// Five entries: the fifth layer has no slot in a four-layer rig and is dropped.
+	let five = dir.path().join("five.json");
+	std::fs::write(
+		&five,
+		r#"{
+			"version": 1,
+			"layers": [
+				{"opacity": 0.11},
+				{"opacity": 0.22},
+				{"opacity": 0.33},
+				{"opacity": 0.44},
+				{"opacity": 0.55}
+			]
+		}"#,
+	)
+	.unwrap();
+	let loaded = load_state(&five).unwrap().unwrap();
+	for (index, expected) in [0.11_f32, 0.22, 0.33, 0.44].into_iter().enumerate() {
+		approx(loaded.layers[index].opacity, expected);
+	}
+	assert!(
+		loaded.layers.iter().all(|layer| (layer.opacity - 0.55).abs() > 1e-5),
+		"the fifth layer entry must be ignored"
+	);
+
+	// Zero entries and a completely empty document still load.
+	let empty = dir.path().join("empty.json");
+	std::fs::write(&empty, "{}").unwrap();
+	let loaded = load_state(&empty).unwrap().unwrap();
+	assert_eq!(loaded.layers, PersistedState::default().layers);
+}
+
+// ---------------------------------------------------------------------------
+// SPEC §11 MIDI <-> UI parity
+// ---------------------------------------------------------------------------
+
+/// One row of the MIDI -> UI parity table.
+struct ParityCase {
+	/// Control being exercised, used in assertion messages.
+	name: &'static str,
+	/// Action produced by the Launch Control XL 3 mapping.
+	midi: MidiAction,
+	/// Equivalent command produced by the keyboard/UI layer.
+	ui: UiCommand,
+}
+
+/// Initial state every parity row starts from.
+///
+/// All four layers are playing a distinct clip part-way through, so trigger,
+/// retrigger and pause rows exercise real transport changes, and the master
+/// effects sit at non-neutral values.
+fn parity_state() -> AppState {
+	let mut app = state_with_clips(4);
+	for (index, target) in LayerIndex::ALL.iter().enumerate() {
+		let id = ClipId(index as u64 + 1);
+		let layer = app.layer_mut(*target).unwrap();
+		layer.selected_clip = Some(id);
+		layer.active_clip = Some(id);
+		layer.playback_state = PlaybackState::Playing;
+		layer.playhead_frame = 7.0;
+		layer.frame_count = 30;
+		layer.clip_fps = 30.0;
+		layer.speed = 1.0 + index as f32 * 0.25;
+		layer.opacity = 0.8;
+		layer.blend_mode = BlendMode::ALL[index];
+	}
+	app.effects = MasterEffects {
+		rgb_shift_enabled: false,
+		rgb_shift_intensity: 0.2,
+		glitch_enabled: true,
+		glitch_intensity: 0.3,
+		strobe_enabled: false,
+		strobe_intensity: 0.4,
+		strobe_speed_hz: 6.0,
+		brightness: 0.1,
+		contrast: 1.2,
+		saturation: 0.9,
+		master_dimmer: 0.85,
+		blackout: false,
+	};
+	app.focused_layer = LayerIndex::ALL[1];
+	app
+}
+
+/// Every mapped MIDI control paired with its UI equivalent (SPEC §11).
+fn parity_cases() -> Vec<ParityCase> {
+	let first = LayerIndex::ALL[0];
+	let second = LayerIndex::ALL[1];
+	let selected_id = ClipId(resolve_clip_index(100, 4).unwrap() as u64 + 1);
+	vec![
+		ParityCase {
+			name: "SetLayerOpacity",
+			midi: MidiAction::SetLayerOpacity {
+				layer: first,
+				opacity: 0.42,
+			},
+			ui: UiCommand::SetLayerOpacity {
+				layer: first,
+				opacity: 0.42,
+			},
+		},
+		ParityCase {
+			name: "SetLayerSpeed",
+			midi: MidiAction::SetLayerSpeed {
+				layer: second,
+				speed: 2.5,
+			},
+			ui: UiCommand::SetLayerSpeed {
+				layer: second,
+				speed: 2.5,
+			},
+		},
+		ParityCase {
+			name: "SetLayerBlendMode",
+			midi: MidiAction::SetLayerBlendMode {
+				layer: first,
+				blend_mode: BlendMode::from_midi_cc(64),
+			},
+			ui: UiCommand::SetLayerBlendMode {
+				layer: first,
+				blend_mode: BlendMode::from_midi_cc(64),
+			},
+		},
+		ParityCase {
+			name: "SelectLayerClip",
+			midi: MidiAction::SelectLayerClip {
+				layer: second,
+				cc_value: 100,
+			},
+			ui: UiCommand::SelectLayerClip {
+				layer: second,
+				clip_id: selected_id,
+			},
+		},
+		ParityCase {
+			name: "TriggerLayer",
+			midi: MidiAction::TriggerLayer(first),
+			ui: UiCommand::TriggerLayer(first),
+		},
+		ParityCase {
+			name: "TogglePauseLayer",
+			midi: MidiAction::TogglePauseLayer(second),
+			ui: UiCommand::TogglePauseLayer(second),
+		},
+		ParityCase {
+			name: "SetRgbShiftIntensity",
+			midi: MidiAction::SetRgbShiftIntensity(0.7),
+			ui: UiCommand::SetRgbShiftIntensity(0.7),
+		},
+		ParityCase {
+			name: "SetGlitchIntensity",
+			midi: MidiAction::SetGlitchIntensity(0.55),
+			ui: UiCommand::SetGlitchIntensity(0.55),
+		},
+		ParityCase {
+			name: "SetStrobeIntensity",
+			midi: MidiAction::SetStrobeIntensity(0.9),
+			ui: UiCommand::SetStrobeIntensity(0.9),
+		},
+		ParityCase {
+			name: "SetMasterDimmer",
+			midi: MidiAction::SetMasterDimmer(0.35),
+			ui: UiCommand::SetMasterDimmer(0.35),
+		},
+		ParityCase {
+			name: "SetBrightness",
+			midi: MidiAction::SetBrightness(-0.2),
+			ui: UiCommand::SetBrightness(-0.2),
+		},
+		ParityCase {
+			name: "SetContrast",
+			midi: MidiAction::SetContrast(1.6),
+			ui: UiCommand::SetContrast(1.6),
+		},
+		ParityCase {
+			name: "SetSaturation",
+			midi: MidiAction::SetSaturation(0.4),
+			ui: UiCommand::SetSaturation(0.4),
+		},
+		ParityCase {
+			name: "SetStrobeSpeedHz",
+			midi: MidiAction::SetStrobeSpeedHz(12.0),
+			ui: UiCommand::SetStrobeSpeedHz(12.0),
+		},
+		ParityCase {
+			name: "ToggleRgbShift",
+			midi: MidiAction::ToggleRgbShift,
+			ui: UiCommand::ToggleRgbShift,
+		},
+		ParityCase {
+			name: "ToggleGlitch",
+			midi: MidiAction::ToggleGlitch,
+			ui: UiCommand::ToggleGlitch,
+		},
+		ParityCase {
+			name: "ToggleStrobe",
+			midi: MidiAction::ToggleStrobe,
+			ui: UiCommand::ToggleStrobe,
+		},
+		ParityCase {
+			name: "ToggleBlackout",
+			midi: MidiAction::ToggleBlackout,
+			ui: UiCommand::ToggleBlackout,
+		},
+		ParityCase {
+			name: "ResetAllEffects",
+			midi: MidiAction::ResetAllEffects,
+			ui: UiCommand::ResetAllEffects,
+		},
+		ParityCase {
+			name: "RetriggerAllActiveLayers",
+			midi: MidiAction::RetriggerAllActiveLayers,
+			ui: UiCommand::RetriggerAllActiveLayers,
+		},
+		ParityCase {
+			name: "ToggleFocusedLayerPlaybackMode",
+			midi: MidiAction::ToggleFocusedLayerPlaybackMode,
+			ui: UiCommand::ToggleLayerPlaybackMode(second),
+		},
+		ParityCase {
+			name: "ResetAllLayerSpeeds",
+			midi: MidiAction::ResetAllLayerSpeeds,
+			ui: UiCommand::ResetAllLayerSpeeds,
+		},
+	]
+}
+
+#[test]
+fn midi_actions_and_ui_commands_mutate_identical_state() {
+	let cases = parity_cases();
+	assert_eq!(cases.len(), 22, "SPEC §11 maps 22 distinct MIDI controls");
+
+	for case in cases {
+		let mut midi_app = parity_state();
+		let mut ui_app = parity_state();
+
+		let midi_outcome = apply_midi_action(&mut midi_app, case.midi);
+		let ui_outcome = apply_ui_command(&mut ui_app, &case.ui);
+
+		assert_eq!(midi_app.layers, ui_app.layers, "`{}`: layer state diverged", case.name);
+		assert_eq!(
+			midi_app.focused_layer, ui_app.focused_layer,
+			"`{}`: focus diverged",
+			case.name
+		);
+		assert_eq!(midi_app.effects, ui_app.effects, "`{}`: effects diverged", case.name);
+		assert_eq!(midi_app.dirty, ui_app.dirty, "`{}`: dirty flag diverged", case.name);
+		for target in LayerIndex::ALL {
+			assert_eq!(
+				midi_outcome.contains(target),
+				ui_outcome.was_retriggered(target),
+				"`{}`: retrigger flag for {target} diverged",
+				case.name
+			);
+		}
+	}
 }

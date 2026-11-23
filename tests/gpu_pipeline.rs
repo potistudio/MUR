@@ -19,7 +19,7 @@ use mur::media::{ClipAsset, decode_frame_to_rgba8, load_clip};
 use mur::model::{
 	BlendMode, ClipId, ClipKind, DecodedFrame, LayerIndex, LayerState, MasterEffects, PixelPayload, PlaybackMode,
 };
-use mur::render::texture_cache::plan_upload;
+use mur::render::texture_cache::{LayerUploadStatus, plan_upload};
 use mur::render::{GpuContext, INTERNAL_HEIGHT, INTERNAL_WIDTH, LayerRenderInput, MasterRenderer, fit_rect};
 
 /// Serializes GPU tests so the sustained frame-budget test is not disturbed by
@@ -691,20 +691,70 @@ fn present_surface_letterboxes_a_16_by_9_output_on_a_4_by_3_target() {
 // Sustained four-layer 1080p performance
 // ---------------------------------------------------------------------------
 
+/// Copies the raw payload bytes out of a decoded frame.
+fn payload_bytes(frame: &DecodedFrame) -> &[u8] {
+	match &frame.payload {
+		PixelPayload::Bc1(bytes) | PixelPayload::Bc3(bytes) | PixelPayload::Bc3YCoCg(bytes) => bytes,
+		PixelPayload::Rgba8(bytes) => bytes,
+	}
+}
+
+/// Upper bound a decode may take before a streaming test calls it a stall.
+const EXACT_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Polls `layer` until `poll_frame` delivers the exact requested frame.
+///
+/// [`LayerStreamer::poll_frame`] may return the nearest buffered frame while the
+/// exact one is still decoding, so tests that assert on frame identity must keep
+/// polling instead of accepting the first `Some`.
+fn wait_for_exact_frame(
+	streamer: &mur::media::LayerStreamer,
+	layer: LayerIndex,
+	clip_id: ClipId,
+	desired: u32,
+	tick: u32,
+) -> Arc<DecodedFrame> {
+	let start = Instant::now();
+	loop {
+		if let Some(frame) = streamer.poll_frame(layer, clip_id, desired)
+			&& frame.frame_index == desired
+		{
+			return frame;
+		}
+		assert!(
+			start.elapsed() < EXACT_FRAME_TIMEOUT,
+			"tick {tick}: layer {layer} never delivered frame {desired} within {EXACT_FRAME_TIMEOUT:?}"
+		);
+		std::thread::sleep(std::time::Duration::from_millis(1));
+	}
+}
+
 /// Builds four distinct 1920x1080 clips (HAP, HAP Alpha, HAP Q, and a PNG).
-fn build_fhd_clips(dir: &TempDir) -> Vec<(ClipId, mur::model::ClipInfo, ClipAsset)> {
+///
+/// The three HAP fixtures are authored at 60 fps (`timescale = 30_000`,
+/// `sample_duration = 500`) with six frames each, so every `1/60 s` tick lands on
+/// a distinct frame and the whole clip fits into the prefetch ring at once. The
+/// returned fixtures let tests assert the decoded payload byte for byte; the
+/// still image has no fixture, so `fixtures` holds three entries.
+fn build_fhd_clips(dir: &TempDir) -> (Vec<(ClipId, mur::model::ClipInfo, ClipAsset)>, Vec<HapMovFixture>) {
 	let mut clips = Vec::with_capacity(4);
+	let mut fixtures = Vec::with_capacity(3);
 	let kinds = [ClipKind::Hap, ClipKind::HapAlpha, ClipKind::HapQ];
 	for (index, kind) in kinds.iter().enumerate() {
 		let path = dir.path().join(format!("perf_{index}.mov"));
 		let mut fixture = HapMovFixture::new(*kind, INTERNAL_WIDTH, INTERNAL_HEIGHT, 6);
 		fixture.compression = FixtureCompression::Snappy;
+		fixture.timescale = 30_000;
+		fixture.sample_duration = 500;
 		fixture.use_co64 = index == 2;
 		fixture.include_audio_track = index == 1;
 		fixture.write_to(&path).unwrap();
 		let id = ClipId(index as u64 + 1);
 		let (info, asset) = load_clip(id, &path).unwrap();
+		assert_eq!(info.frame_count, 6);
+		assert!((info.fps - 60.0).abs() < 0.001, "fixture {index} must be 60 fps");
 		clips.push((id, info, asset));
+		fixtures.push(fixture);
 	}
 
 	let png_path = dir.path().join("perf_still.png");
@@ -720,7 +770,34 @@ fn build_fhd_clips(dir: &TempDir) -> Vec<(ClipId, mur::model::ClipInfo, ClipAsse
 	let id = ClipId(4);
 	let (info, asset) = load_clip(id, &png_path).unwrap();
 	clips.push((id, info, asset));
-	clips
+	(clips, fixtures)
+}
+
+/// Blocks until every non-zero frame of the clip is inside the layer's ring.
+fn prime_full_clip(streamer: &mur::media::LayerStreamer, clips: &[(ClipId, mur::model::ClipInfo, ClipAsset)]) {
+	for (index, layer) in LayerIndex::ALL.iter().enumerate() {
+		let (id, info, _) = &clips[index];
+		streamer.request_layer_state(*layer, *id, 0, 1.0, PlaybackMode::Loop, true);
+		if info.frame_count <= 1 {
+			continue;
+		}
+		let start = Instant::now();
+		let primed = loop {
+			let buffered = streamer.buffered_frames(*layer);
+			if (1..info.frame_count).all(|frame| buffered.contains(&frame)) {
+				break true;
+			}
+			if start.elapsed() > std::time::Duration::from_secs(15) {
+				break false;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(2));
+		};
+		assert!(
+			primed,
+			"layer {layer} never buffered frames 1..{} of `{}`",
+			info.frame_count, info.name
+		);
+	}
 }
 
 #[test]
@@ -730,8 +807,9 @@ fn four_layer_fhd_sustained_60fps_budget() {
 		return;
 	};
 	let dir = TempDir::new("perf_fhd").unwrap();
-	let clips = build_fhd_clips(&dir);
+	let (clips, fixtures) = build_fhd_clips(&dir);
 	assert_eq!(clips.len(), 4);
+	assert_eq!(fixtures.len(), 3);
 
 	let streamer = mur::media::LayerStreamer::new().unwrap();
 	for (_, info, asset) in &clips {
@@ -772,38 +850,18 @@ fn four_layer_fhd_sustained_60fps_budget() {
 	};
 
 	// Prime the workers so the measured loop only covers steady-state playback.
-	for (index, layer) in LayerIndex::ALL.iter().enumerate() {
-		let (id, info, _) = &clips[index];
-		let desired = if info.frame_count > 1 { 1 } else { 0 };
-		streamer.request_layer_state(
-			*layer,
-			*id,
-			desired,
-			1.0,
-			PlaybackMode::Loop,
-			states[index].playback_state.is_playing(),
-		);
-		if info.frame_count > 1 {
-			let ready = {
-				let start = Instant::now();
-				let mut ready = false;
-				while start.elapsed() < std::time::Duration::from_secs(15) {
-					if streamer.poll_frame(*layer, *id, desired).is_some() {
-						ready = true;
-						break;
-					}
-					std::thread::sleep(std::time::Duration::from_millis(2));
-				}
-				ready
-			};
-			assert!(ready, "layer {layer} did not prime frame {desired}");
-		}
-	}
+	// A 60 fps six-frame clip fits into the 16-entry ring as a whole, so after
+	// this every tick is an exact, instant hit: no decode wait, no `Held` frame.
+	prime_full_clip(&streamer, &clips);
 
 	let mut renderer = MasterRenderer::new(&ctx).unwrap();
 	let dt = 1.0_f32 / 60.0;
 	let frame_budget = 180_u32;
 	let mut gpu_slots: [Option<Arc<DecodedFrame>>; 4] = std::array::from_fn(|_| None);
+	// Texture uploads per layer, plus a global count of frames the cache had to
+	// hold because no new frame arrived. Both must stay at their ideal values.
+	let mut uploads = [0_usize; 4];
+	let mut held_count = 0_usize;
 
 	let start = Instant::now();
 	for tick in 0..frame_budget {
@@ -823,7 +881,30 @@ fn four_layer_fhd_sustained_60fps_budget() {
 				state.playback_mode,
 				state.playback_state.is_playing(),
 			);
-			gpu_slots[index] = streamer.poll_frame(*layer, *id, desired);
+			let frame = streamer
+				.poll_frame(*layer, *id, desired)
+				.unwrap_or_else(|| panic!("tick {tick}: layer {layer} served no frame for {desired}"));
+			assert_eq!(
+				frame.frame_index, desired,
+				"tick {tick}: layer {layer} fell back to frame {} while {desired} was requested",
+				frame.frame_index
+			);
+			gpu_slots[index] = Some(frame);
+		}
+
+		if tick % 30 == 0 {
+			for (index, fixture) in fixtures.iter().enumerate() {
+				let frame = gpu_slots
+					.get(index)
+					.and_then(Option::as_ref)
+					.expect("every layer was polled above");
+				let expected = fixture.frame_payload(frame.frame_index).unwrap();
+				assert_eq!(
+					payload_bytes(frame),
+					expected.as_slice(),
+					"tick {tick}: layer {index} decoded payload differs from the fixture"
+				);
+			}
 		}
 
 		let inputs: [LayerRenderInput<'_>; 4] = std::array::from_fn(|index| {
@@ -844,6 +925,38 @@ fn four_layer_fhd_sustained_60fps_budget() {
 			"tick {tick} must composite all four layers"
 		);
 
+		// `desired` changes on every tick, so all three HAP layers must upload a
+		// fresh texture every tick; the still image is uploaded once and reused.
+		for (index, (status, uploaded)) in report.layers.iter().zip(uploads.iter_mut()).take(3).enumerate() {
+			assert_eq!(
+				*status,
+				LayerUploadStatus::Uploaded,
+				"tick {tick}: HAP layer {index} did not upload a new frame: {status:?}"
+			);
+			*uploaded = uploaded.saturating_add(1);
+		}
+		assert!(
+			matches!(
+				report.layers[3],
+				LayerUploadStatus::Uploaded | LayerUploadStatus::Reused
+			),
+			"tick {tick}: still image must be uploaded or reused: {:?}",
+			report.layers[3]
+		);
+		if matches!(report.layers[3], LayerUploadStatus::Uploaded) {
+			uploads[3] = uploads[3].saturating_add(1);
+		}
+		let uploads_this_tick = report.uploads();
+		assert!(
+			uploads_this_tick >= 3,
+			"tick {tick}: only {uploads_this_tick} layers uploaded a texture"
+		);
+		for status in report.layers {
+			if matches!(status, LayerUploadStatus::Held) {
+				held_count = held_count.saturating_add(1);
+			}
+		}
+
 		if tick % 30 == 0 {
 			ctx.device
 				.poll(wgpu::PollType::Wait {
@@ -863,16 +976,32 @@ fn four_layer_fhd_sustained_60fps_budget() {
 	let avg_ms = elapsed.as_secs_f64() * 1000.0 / f64::from(frame_budget);
 	let fps = 1000.0 / avg_ms;
 	eprintln!(
-		"4-layer 1080p x180 avg frame time: {avg_ms:.3} ms ({fps:.1} fps) \
-		 [adapter={}, backend={:?}, bc={}]",
+		"4-layer 1080p x{frame_budget} @ 60 fps fixtures avg frame time: {avg_ms:.3} ms ({fps:.1} fps) \
+		 [hap_uploads={:?}, still_uploads={}, held={held_count}, adapter={}, backend={:?}, bc={}]",
+		&uploads[..3],
+		uploads[3],
 		ctx.adapter.get_info().name,
 		ctx.adapter.get_info().backend,
 		ctx.supports_bc
 	);
-
 	assert!(
 		ctx.take_last_error().is_none(),
 		"the sustained GPU loop produced validation errors"
+	);
+	assert_eq!(
+		held_count, 0,
+		"the fully primed ring must never fall back to a held frame ({held_count} holds)"
+	);
+	for (index, uploaded) in uploads.iter().take(3).enumerate() {
+		assert_eq!(
+			*uploaded, frame_budget as usize,
+			"HAP layer {index} must upload a texture on every tick"
+		);
+	}
+	assert_eq!(uploads[3], 1, "the still image uploads once and is reused afterwards");
+	assert!(
+		streamer.drain_events().is_empty(),
+		"the sustained loop reported streamer events"
 	);
 
 	#[cfg(not(debug_assertions))]
@@ -884,5 +1013,364 @@ fn four_layer_fhd_sustained_60fps_budget() {
 	assert!(
 		avg_ms < 100.0,
 		"debug build exceeded the sanity budget: {avg_ms:.3} ms per frame ({fps:.1} fps)"
+	);
+}
+
+/// Streams 240 never-repeating frames per HAP layer through the real renderer.
+///
+/// Unlike the sustained budget test this one does not pre-prime: every tick
+/// requests the next, brand new frame, waits (bounded) for the worker to decode
+/// it, and asserts the frame that arrives is the exact one requested. A ring that
+/// silently serves a neighbouring frame would fail here.
+#[test]
+fn four_layer_continuous_decode_streaming_240_frames() {
+	let _guard = gpu_lock();
+	let Some(ctx) = gpu_context("continuous_decode") else {
+		return;
+	};
+	let dir = TempDir::new("perf_stream").unwrap();
+
+	let kinds = [ClipKind::Hap, ClipKind::HapAlpha, ClipKind::HapQ];
+	let mut clips = Vec::with_capacity(4);
+	let mut fixtures = Vec::with_capacity(3);
+	for (index, kind) in kinds.iter().enumerate() {
+		let path = dir.path().join(format!("stream_{index}.mov"));
+		let mut fixture = HapMovFixture::new(*kind, 640, 360, 240);
+		fixture.compression = FixtureCompression::Snappy;
+		// 240 distinct frames at 60 fps: no frame is ever repeated.
+		fixture.timescale = 60_000;
+		fixture.sample_duration = 1_000;
+		fixture.write_to(&path).unwrap();
+		let id = ClipId(index as u64 + 1);
+		let (info, asset) = load_clip(id, &path).unwrap();
+		assert_eq!(info.frame_count, 240);
+		assert!((info.fps - 60.0).abs() < 0.001, "fixture {index} must be 60 fps");
+		clips.push((id, info, asset));
+		fixtures.push(fixture);
+	}
+	let png_path = dir.path().join("stream_still.png");
+	image::RgbaImage::from_pixel(320, 180, image::Rgba([90, 20, 200, 255]))
+		.save(&png_path)
+		.unwrap();
+	let (info, asset) = load_clip(ClipId(4), &png_path).unwrap();
+	clips.push((ClipId(4), info, asset));
+
+	let streamer = mur::media::LayerStreamer::new().unwrap();
+	for (_, _, asset) in &clips {
+		streamer.register_asset(asset.clone());
+	}
+
+	let states: [LayerState; 4] = std::array::from_fn(|index| {
+		let (id, info, _) = &clips[index];
+		let mut state = LayerState::default();
+		state.trigger(*id, info.frame_count.max(1), info.fps);
+		state.playback_mode = PlaybackMode::Loop;
+		state.set_opacity(0.9 - index as f32 * 0.1);
+		state
+	});
+	let mut renderer = MasterRenderer::new(&ctx).unwrap();
+	let mut gpu_slots: [Option<Arc<DecodedFrame>>; 4] = std::array::from_fn(|_| None);
+	let mut uploads = [0_usize; 3];
+	let mut held_count = 0_usize;
+
+	for tick in 0..240_u32 {
+		// At 60 fps a `1/60 s` tick advances the playhead by exactly one frame, so
+		// `desired == tick` walks every distinct frame of the clip once.
+		for (index, layer) in LayerIndex::ALL.iter().enumerate() {
+			let state = &states[index];
+			let (id, info, _) = &clips[index];
+			let desired = tick.min(info.frame_count.saturating_sub(1));
+			streamer.request_layer_state(
+				*layer,
+				*id,
+				desired,
+				state.speed,
+				state.playback_mode,
+				state.playback_state.is_playing(),
+			);
+			let frame = wait_for_exact_frame(&streamer, *layer, *id, desired, tick);
+			assert_eq!(frame.frame_index, desired, "tick {tick}: layer {layer}");
+			gpu_slots[index] = Some(frame);
+		}
+
+		if tick % 30 == 0 {
+			for (index, fixture) in fixtures.iter().enumerate() {
+				let frame = gpu_slots
+					.get(index)
+					.and_then(Option::as_ref)
+					.expect("every layer was polled above");
+				let expected = fixture.frame_payload(frame.frame_index).unwrap();
+				assert_eq!(
+					payload_bytes(frame),
+					expected.as_slice(),
+					"tick {tick}: layer {index} decoded payload differs from the fixture"
+				);
+			}
+		}
+
+		let inputs: [LayerRenderInput<'_>; 4] = std::array::from_fn(|index| {
+			let (id, info, _) = &clips[index];
+			LayerRenderInput {
+				frame: gpu_slots[index].as_deref(),
+				clip_id: Some(*id),
+				opacity: states[index].opacity,
+				blend_mode: states[index].blend_mode,
+				is_opaque_margin: info.is_opaque_margin(),
+			}
+		});
+		let report = renderer
+			.render_master(&ctx, &inputs, &MasterEffects::default(), tick as f32 / 60.0)
+			.unwrap();
+		assert_eq!(
+			report.layers_composited, 4,
+			"tick {tick} must composite all four layers"
+		);
+		for (index, (status, uploaded)) in report.layers.iter().zip(uploads.iter_mut()).take(3).enumerate() {
+			assert_eq!(
+				*status,
+				LayerUploadStatus::Uploaded,
+				"tick {tick}: HAP layer {index} did not upload frame {tick}: {status:?}"
+			);
+			*uploaded = uploaded.saturating_add(1);
+		}
+		for status in report.layers {
+			if matches!(status, LayerUploadStatus::Held) {
+				held_count = held_count.saturating_add(1);
+			}
+		}
+	}
+	ctx.device
+		.poll(wgpu::PollType::Wait {
+			submission_index: None,
+			timeout: None,
+		})
+		.unwrap();
+
+	eprintln!(
+		"continuous decode: 240 frames x 3 HAP layers, uploads={uploads:?}, held={held_count}, adapter={}",
+		ctx.adapter.get_info().name
+	);
+	assert_eq!(
+		held_count, 0,
+		"waiting for each exact frame must never leave a held frame"
+	);
+	for (index, uploaded) in uploads.iter().enumerate() {
+		assert_eq!(*uploaded, 240, "HAP layer {index} must upload all 240 distinct frames");
+	}
+	assert!(
+		ctx.take_last_error().is_none(),
+		"the continuous decode loop produced validation errors"
+	);
+	assert!(
+		streamer.drain_events().is_empty(),
+		"the continuous decode loop reported streamer events"
+	);
+}
+
+/// Reads the soak duration from `MUR_SOAK_SECS`, defaulting to 30 minutes.
+fn soak_duration() -> std::time::Duration {
+	let seconds = std::env::var("MUR_SOAK_SECS")
+		.ok()
+		.and_then(|value| value.trim().parse::<u64>().ok())
+		.filter(|seconds| *seconds > 0)
+		.unwrap_or(1800);
+	std::time::Duration::from_secs(seconds)
+}
+
+/// Long-running four-layer soak with live MIDI traffic.
+///
+/// Run with `MUR_SOAK_SECS=600 cargo test --release --test gpu_pipeline -- --ignored`,
+/// or `MUR_SOAK_SECS=60` for a quick smoke run.
+#[test]
+#[ignore = "long-running soak: run with cargo test --release --test gpu_pipeline -- --ignored"]
+fn soak_four_layer_sustained_with_midi() {
+	let _guard = gpu_lock();
+	let Some(ctx) = gpu_context("soak") else {
+		return;
+	};
+	let dir = TempDir::new("soak").unwrap();
+	let (clips, _fixtures) = build_fhd_clips(&dir);
+	let streamer = mur::media::LayerStreamer::new().unwrap();
+	for (_, _, asset) in &clips {
+		streamer.register_asset(asset.clone());
+	}
+
+	let mut states: [LayerState; 4] = std::array::from_fn(|index| {
+		let (id, info, _) = &clips[index];
+		let mut state = LayerState::default();
+		state.trigger(*id, info.frame_count.max(1), info.fps);
+		state.playback_mode = PlaybackMode::Loop;
+		state.set_opacity(0.9 - index as f32 * 0.1);
+		state
+	});
+	prime_full_clip(&streamer, &clips);
+
+	let mut renderer = MasterRenderer::new(&ctx).unwrap();
+	let mut app = mur::model::AppState {
+		effects: MasterEffects {
+			rgb_shift_enabled: true,
+			rgb_shift_intensity: 0.4,
+			glitch_enabled: true,
+			glitch_intensity: 0.3,
+			master_dimmer: 0.9,
+			..MasterEffects::default()
+		},
+		..mur::model::AppState::default()
+	};
+
+	// Raw packets for the production parser so the soak exercises the whole
+	// MIDI path (parse -> apply), cycling through layer, effect, and reset notes.
+	const MIDI_CYCLE: [[u8; 3]; 8] = [
+		[0xB0, 5, 64],
+		[0xB0, 6, 32],
+		[0xB0, 1, 90],
+		[0x90, 40, 100],
+		[0x90, 44, 100],
+		[0xB0, 21, 100],
+		[0x90, 48, 100],
+		[0xB0, 8, 110],
+	];
+	let cycle_len = MIDI_CYCLE.len() as u64;
+	let soak = soak_duration();
+	let dt = 1.0_f32 / 60.0;
+	let started = Instant::now();
+	let mut ticks: u64 = 0;
+	let mut held_count = 0_usize;
+	let mut missed_frames = 0_usize;
+	let mut uploads = [0_usize; 4];
+	let mut gpu_slots: [Option<Arc<DecodedFrame>>; 4] = std::array::from_fn(|_| None);
+
+	eprintln!(
+		"soaking 4x1080p for {:.0}s on `{}` (synthetic 60 fps fixtures, MIDI traffic every tick)",
+		soak.as_secs_f64(),
+		ctx.adapter.get_info().name
+	);
+
+	while started.elapsed() < soak {
+		for state in &mut states {
+			state.advance_playhead(dt);
+		}
+
+		for (index, layer) in LayerIndex::ALL.iter().enumerate() {
+			let state = &states[index];
+			let (id, _, _) = &clips[index];
+			let desired = state.current_frame_index();
+			streamer.request_layer_state(
+				*layer,
+				*id,
+				desired,
+				state.speed,
+				state.playback_mode,
+				state.playback_state.is_playing(),
+			);
+			match streamer.poll_frame(*layer, *id, desired) {
+				Some(frame) if frame.frame_index == desired => gpu_slots[index] = Some(frame),
+				other => {
+					missed_frames = missed_frames.saturating_add(1);
+					if let Some(frame) = other {
+						gpu_slots[index] = Some(frame);
+					}
+				}
+			}
+		}
+
+		if let Some(action) = MIDI_CYCLE
+			.get((ticks % cycle_len) as usize)
+			.and_then(|packet| mur::midi::parse_midi_message(packet))
+		{
+			let _ = mur::midi::apply_midi_action(&mut app, action);
+		}
+
+		let inputs: [LayerRenderInput<'_>; 4] = std::array::from_fn(|index| {
+			let (id, info, _) = &clips[index];
+			LayerRenderInput {
+				frame: gpu_slots[index].as_deref(),
+				clip_id: Some(*id),
+				opacity: states[index].opacity,
+				blend_mode: states[index].blend_mode,
+				is_opaque_margin: info.is_opaque_margin(),
+			}
+		});
+		let report = renderer
+			.render_master(&ctx, &inputs, &app.effects, ticks as f32 * dt)
+			.unwrap();
+		assert_eq!(
+			report.layers_composited, 4,
+			"soak tick {ticks} must composite all four layers"
+		);
+		for (status, uploaded) in report.layers.iter().zip(uploads.iter_mut()).take(3) {
+			if matches!(status, LayerUploadStatus::Uploaded) {
+				*uploaded = uploaded.saturating_add(1);
+			}
+		}
+		for status in report.layers {
+			if matches!(status, LayerUploadStatus::Held) {
+				held_count = held_count.saturating_add(1);
+			}
+		}
+
+		if ticks.is_multiple_of(300) {
+			let events = streamer.drain_events();
+			assert!(
+				events.is_empty(),
+				"soak reported streamer events at tick {ticks}: {events:?}"
+			);
+		}
+		if ticks.is_multiple_of(3600) {
+			ctx.device
+				.poll(wgpu::PollType::Wait {
+					submission_index: None,
+					timeout: None,
+				})
+				.unwrap();
+			eprintln!(
+				"soak progress: {:.1}s / {:.0}s, {ticks} frames, held={held_count}, missed={missed_frames}",
+				started.elapsed().as_secs_f64(),
+				soak.as_secs_f64()
+			);
+		}
+		ticks = ticks.saturating_add(1);
+	}
+
+	ctx.device
+		.poll(wgpu::PollType::Wait {
+			submission_index: None,
+			timeout: None,
+		})
+		.unwrap();
+	let elapsed = started.elapsed();
+	let avg_ms = elapsed.as_secs_f64() * 1000.0 / ticks.max(1) as f64;
+	let fps = 1000.0 / avg_ms;
+	eprintln!(
+		"soak finished: {ticks} frames in {:.1}s, avg {avg_ms:.3} ms ({fps:.1} fps), \
+		 hap_uploads={:?}, held={held_count}, missed={missed_frames}",
+		elapsed.as_secs_f64(),
+		&uploads[..3]
+	);
+
+	let events = streamer.drain_events();
+	assert!(events.is_empty(), "soak ended with streamer events: {events:?}");
+	assert!(
+		ctx.take_last_error().is_none(),
+		"the soak produced GPU validation errors"
+	);
+	assert_eq!(
+		held_count, 0,
+		"a primed four-layer soak must never hold a frame ({held_count} holds)"
+	);
+	assert_eq!(
+		missed_frames, 0,
+		"a primed four-layer soak must serve every exact frame ({missed_frames} misses)"
+	);
+
+	#[cfg(not(debug_assertions))]
+	assert!(
+		avg_ms < 16.67,
+		"release soak missed the 60 fps budget: {avg_ms:.3} ms per frame ({fps:.1} fps)"
+	);
+	#[cfg(debug_assertions)]
+	assert!(
+		avg_ms < 100.0,
+		"debug soak exceeded the sanity budget: {avg_ms:.3} ms per frame ({fps:.1} fps)"
 	);
 }

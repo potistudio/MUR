@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mur::error::MediaError;
+use mur::media::mov::FALLBACK_FPS;
 use mur::media::test_fixtures::{FixtureCompression, HapMovFixture, TempDir};
 use mur::media::{ClipBacking, LayerStreamEvent, LayerStreamer, expected_hap_bytes, load_clip, scan_media_dir};
 use mur::model::{ClipId, ClipKind, DecodedFrame, LayerIndex, LayerState, PixelPayload, PlaybackMode, PlaybackState};
@@ -320,6 +321,161 @@ fn corrupt_truncated_and_garbage_media_is_rejected_without_panicking() {
 }
 
 // ---------------------------------------------------------------------------
+// Container edge cases
+// ---------------------------------------------------------------------------
+
+/// Extracts the human readable detail of a [`MediaError::Corrupt`].
+fn corrupt_detail(error: MediaError) -> String {
+	match error {
+		MediaError::Corrupt { detail, .. } => detail,
+		other => panic!("expected MediaError::Corrupt, got {other:?}"),
+	}
+}
+
+#[test]
+fn zero_sample_movie_is_rejected_with_a_clear_error() {
+	let dir = TempDir::new("zero_samples").unwrap();
+	let path = write_movie(
+		dir.path(),
+		"zero.mov",
+		movie(ClipKind::Hap, 32, 32, 0, FixtureCompression::Snappy, false, false),
+	);
+	let error = load_clip(ClipId(1), &path).unwrap_err();
+	assert!(matches!(error, MediaError::Corrupt { .. }), "{error:?}");
+	assert!(
+		corrupt_detail(error).contains("video track contains no samples"),
+		"a zero-sample movie must say why it was rejected"
+	);
+}
+
+#[test]
+fn single_frame_movies_play_in_loop_and_one_shot() {
+	let dir = TempDir::new("single_frame").unwrap();
+	let path = write_movie(
+		dir.path(),
+		"single.mov",
+		movie(ClipKind::HapAlpha, 32, 24, 1, FixtureCompression::Snappy, false, false),
+	);
+	let (info, asset) = load_clip(ClipId(1), &path).unwrap();
+	assert_eq!(info.frame_count, 1);
+	assert_eq!(info.kind, ClipKind::HapAlpha);
+	let fixture = HapMovFixture::new(ClipKind::HapAlpha, 32, 24, 1);
+	assert_eq!(
+		payload_bytes(&asset.first_frame),
+		fixture.frame_payload(0).unwrap().as_slice()
+	);
+
+	let streamer = LayerStreamer::new().unwrap();
+	streamer.register_asset(asset);
+
+	for mode in [PlaybackMode::Loop, PlaybackMode::OneShot] {
+		let mut layer = LayerState::default();
+		layer.trigger(ClipId(1), 1, info.fps);
+		layer.playback_mode = mode;
+		// A one-frame clip stays on frame 0 and never stops on its own.
+		for _ in 0..3 {
+			layer.advance_playhead(0.5);
+			assert_eq!(layer.playhead_frame, 0.0, "{mode:?}");
+			assert_eq!(layer.current_frame_index(), 0, "{mode:?}");
+		}
+		assert_eq!(layer.playback_state, PlaybackState::Playing, "{mode:?}");
+
+		let desired = layer.current_frame_index();
+		assert!(streamer.request_layer_state(
+			L1,
+			ClipId(1),
+			desired,
+			layer.speed,
+			mode,
+			layer.playback_state.is_playing(),
+		));
+		let frame = streamer.poll_frame(L1, ClipId(1), desired).unwrap();
+		assert_eq!(frame.frame_index, 0, "{mode:?}");
+		assert_eq!((frame.width, frame.height), (32, 24), "{mode:?}");
+	}
+	assert!(streamer.drain_events().is_empty(), "a one-frame clip must never fail");
+}
+
+#[test]
+fn missing_or_absurd_sample_timing_falls_back_to_sixty_fps() {
+	let dir = TempDir::new("fallback_fps").unwrap();
+	let mut omitted = movie(ClipKind::Hap, 24, 16, 4, FixtureCompression::Snappy, false, false);
+	omitted.omit_stts = true;
+	let mut slow = movie(ClipKind::Hap, 24, 16, 4, FixtureCompression::Snappy, false, false);
+	slow.timescale = 1;
+	slow.sample_duration = 100_000;
+
+	for (name, fixture) in [("omitted_stts.mov", omitted), ("slow_motion.mov", slow)] {
+		let path = write_movie(dir.path(), name, fixture);
+		let (info, asset) = load_clip(ClipId(1), &path).unwrap();
+		assert_eq!(info.frame_count, 4, "{name}");
+		assert!(
+			(info.fps - FALLBACK_FPS).abs() < 1e-6,
+			"`{name}` must fall back to {FALLBACK_FPS} fps, got {}",
+			info.fps
+		);
+
+		let streamer = LayerStreamer::new().unwrap();
+		streamer.register_asset(asset);
+		assert!(streamer.request_layer_state(L1, ClipId(1), 2, 1.0, PlaybackMode::Loop, true));
+		assert!(
+			wait_until(|| streamer
+				.poll_frame(L1, ClipId(1), 2)
+				.is_some_and(|frame| frame.frame_index == 2)),
+			"`{name}` never played frame 2"
+		);
+		assert!(streamer.drain_events().is_empty(), "`{name}` reported errors");
+	}
+}
+
+#[test]
+fn corrupt_sample_tables_are_rejected() {
+	let dir = TempDir::new("corrupt_tables").unwrap();
+
+	let mut misplaced = movie(ClipKind::Hap, 16, 16, 4, FixtureCompression::Snappy, false, false);
+	misplaced.stsc_first_chunk = Some(2);
+	let path = write_movie(dir.path(), "stsc_gap.mov", misplaced);
+	let error = load_clip(ClipId(1), &path).unwrap_err();
+	assert!(matches!(error, MediaError::Corrupt { .. }), "{error:?}");
+	let detail = corrupt_detail(error);
+	assert!(detail.contains("chunk 1"), "{detail}");
+
+	let mut oversized = movie(ClipKind::Hap, 16, 16, 4, FixtureCompression::Snappy, false, false);
+	oversized.sample_size_override = Some(300 * 1024 * 1024);
+	let path = write_movie(dir.path(), "oversized.mov", oversized);
+	let error = load_clip(ClipId(2), &path).unwrap_err();
+	assert!(matches!(error, MediaError::Corrupt { .. }), "{error:?}");
+	let detail = corrupt_detail(error);
+	assert!(detail.contains("exceeds the limit"), "{detail}");
+}
+
+#[test]
+fn clear_layer_stops_serving_frames_immediately() {
+	let dir = TempDir::new("clear_layer").unwrap();
+	let streamer = LayerStreamer::new().unwrap();
+	load_and_register(&streamer, dir.path(), "clear.mov", 1, ClipKind::Hap);
+	assert!(streamer.request_layer_state(L1, ClipId(1), 3, 1.0, PlaybackMode::Loop, true));
+	assert!(
+		wait_until(|| streamer
+			.poll_frame(L1, ClipId(1), 3)
+			.is_some_and(|frame| frame.frame_index == 3)),
+		"frame 3 was never decoded"
+	);
+
+	let before = streamer.layer_generation(L1).unwrap();
+	streamer.clear_layer(L1);
+	// No sleep and no polling window: clearing bumps the generation and drops the
+	// ring synchronously, so stale frames can never leak onto the live output.
+	assert!(streamer.layer_generation(L1).unwrap() > before);
+	assert!(
+		streamer.poll_frame(L1, ClipId(1), 3).is_none(),
+		"a cleared layer must not serve buffered frames"
+	);
+	assert!(streamer.poll_frame(L1, ClipId(1), 4).is_none());
+	assert!(streamer.buffered_frames(L1).is_empty());
+}
+
+// ---------------------------------------------------------------------------
 // Four-layer streamer fault isolation
 // ---------------------------------------------------------------------------
 
@@ -337,7 +493,9 @@ fn four_layer_streamer_isolates_a_truncated_layer() {
 	for (offset, layer) in LayerIndex::ALL.iter().enumerate() {
 		let id = ClipId(offset as u64 + 1);
 		assert!(
-			wait_until(|| streamer.poll_frame(*layer, id, 1).is_some()),
+			wait_until(|| streamer
+				.poll_frame(*layer, id, 1)
+				.is_some_and(|frame| frame.frame_index == 1)),
 			"layer {layer} never delivered frame 1"
 		);
 	}
@@ -390,7 +548,9 @@ fn four_layer_streamer_isolates_a_truncated_layer() {
 		let id = ClipId([1_u64, 3, 4][offset]);
 		streamer.request_layer_state(layer, id, 33, 1.0, PlaybackMode::Loop, true);
 		assert!(
-			wait_until(|| streamer.poll_frame(layer, id, 33).is_some()),
+			wait_until(|| streamer
+				.poll_frame(layer, id, 33)
+				.is_some_and(|frame| frame.frame_index == 33)),
 			"layer {layer} stalled after layer 2 failed"
 		);
 	}
@@ -440,7 +600,9 @@ fn playback_sequencing_loop_oneshot_and_retrigger_match_the_streamer() {
 			assert!(streamer.poll_frame(L1, ClipId(1), 0).is_some());
 		} else {
 			assert!(
-				wait_until(|| streamer.poll_frame(L1, ClipId(1), desired).is_some()),
+				wait_until(|| streamer
+					.poll_frame(L1, ClipId(1), desired)
+					.is_some_and(|frame| frame.frame_index == desired)),
 				"frame {desired} was never decoded"
 			);
 		}
