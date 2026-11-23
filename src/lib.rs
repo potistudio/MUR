@@ -7,6 +7,7 @@
 
 #![warn(missing_docs)]
 
+pub mod app;
 pub mod config;
 pub mod error;
 pub mod media;
