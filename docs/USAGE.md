@@ -20,8 +20,8 @@ cargo run --release -- [OPTIONS]
 | `--project <PATH>` | `.toml` or `.json` file | Applies project clips, layer settings, master effects, output display, and preferred MIDI port |
 | `--state <PATH>` | `.json` file | Overrides the default auto-saved `state.json` location for both restore and auto-save |
 | `--no-restore` | *(flag)* | Skips loading the previous session's `state.json` on startup |
-| `--help` | *(flag)* | Prints CLI usage |
-| `--version` | *(flag)* | Prints version information |
+| `-h`, `--help` | *(flag)* | Prints CLI usage |
+| `-V`, `--version` | *(flag)* | Prints version information |
 
 ### Startup & Auto-Restore Order
 
@@ -75,19 +75,19 @@ Four side-by-side layer strips (`L1` through `L4`, composited bottom-to-top from
   - Click `+ Folder` to scan a directory for supported media.
   - **Drag & drop** media files, folders, or `.toml`/`.json` project files anywhere onto the control window.
 - **Clip Tiles**:
-  - Top-left badge identifies the decoded format: `HAP` (`DXT1`), `HAP A` (`DXT5`), `HAP Q` (`YCoCg`), or `IMG` (`RGBA`).
+  - Top-left badge identifies the clip type (`HAP`, `HAP A`, `HAP Q`, or `IMG`); the pixel/compression format (`DXT1`, `DXT5`, `YCoCg`, `RGBA`) appears in the hover tooltip and layer strip.
   - Top-right cyan pill lists any layers currently playing that clip (e.g. `L1 L3`).
   - **Single-click** thumbnail: selects the clip as `Next ▸` on the currently focused layer.
   - **Double-click** thumbnail: fires the clip immediately on the currently focused layer.
   - **`1` `2` `3` `4` buttons**: fires the clip directly on Layer 1–4.
-  - **`×` button**: unloads the clip from the library and clears any layer playing it.
+  - **`×` button**: unloads an unused clip in one click. If the clip is currently live on any layer, clicking `×` arms a 3-second confirmation (`×?` in amber); click `×?` again within 3 seconds to unload the clip and clear those layers.
 
 ### Non-Blocking Overlays
 
 - **Toasts** (bottom-right): Up to 8 transient notifications (`INFO` 3.5s, `WARN` 6s, `ERROR` 10s) with `Clear notifications`.
 - **Log Drawer** (`G`): Floating window showing up to 200 recent in-memory log entries, newest first.
 - **Shortcuts Overlay** (`H` or `?`): Centered keyboard reference table.
-- **Exit Confirmation Guard**: Modal dialog (`Exit MUR?` / `Live VJ output will stop.`) that disables all live controls behind it until confirmed (`Enter`) or cancelled (`Esc`).
+- **Exit Confirmation Guard**: Modal dialog (`Exit MUR?` / `Live VJ output will stop.`) triggered by `Cmd+Q`, `Ctrl+Q`, `Alt+F4`, the window close button, or macOS Dock/menu Quit. All live controls behind it are disabled and **`Enter` is intentionally swallowed** so live clip triggering cannot accidentally exit; confirm by clicking **Quit MUR** or repeating a quit shortcut (`Cmd + Q` / `Ctrl + Q` / `Alt + F4`), or cancel with `Escape` / **Cancel (Esc)**.
 
 ---
 
@@ -104,7 +104,7 @@ MUR renders internally at **1920×1080 @ 60 fps** and scales the master output a
 ### macOS Behavior
 
 - **Space-Free Overlay**: Instead of macOS native fullscreen Spaces (which animate slowly and can blank secondary displays), MUR places a borderless `NSWindow` configured with `CanJoinAllSpaces | Stationary | IgnoresCycle | FullScreenAuxiliary` at level `NSMainMenuWindowLevel + 1` and `hidesOnDeactivate = false`. It covers the Menu Bar and Dock of the target display, handles Retina HiDPI scaling cleanly, and stays live while you interact with the control window.
-- **Quit Guard**: `Cmd+Q`, the app menu `Quit` item, and Dock `Quit` are intercepted via `NSApplication` menu retargeting and `applicationShouldTerminate:` so accidental quits only bring up the exit confirmation dialog.
+- **Quit Guard**: `Cmd+Q`, the app menu `Quit` item, and Dock `Quit` are intercepted via `NSApplication` menu retargeting and `applicationShouldTerminate:` so accidental quits—and OS logout/shutdown attempts while a live set is running—bring up the exit confirmation dialog instead of terminating immediately.
 
 ### Windows Behavior
 
@@ -122,6 +122,8 @@ MUR renders internally at **1920×1080 @ 60 fps** and scales the master output a
 ## 4. Novation Launch Control XL 3 Mapping (MIDI Channel 1)
 
 MUR uses a fixed **Custom Mode** template on **MIDI Channel 1**. Messages on Channels 2–16, Note Off, and Note On with velocity `0` are ignored.
+
+When set to `Auto (LCXL3)`, auto-detection matches Launch Control / Novation port hints, skips Launch Control XL 3 `"DAW"` integration ports (word-by-word), prefers physical `"MIDI"` ports over virtual loopbacks, and **does not auto-connect to unknown third-party MIDI gear**. To use another controller, select its port explicitly from the top-bar `MIDI` dropdown.
 
 ### Hardware Template Requirements
 
@@ -164,6 +166,9 @@ Configure a Custom Mode slot in **Novation Components** with:
 | Button Row 2 (15) | Note | `50` | Toggle Focused Layer Playback Mode | Switches the currently focused layer between `Loop` and `OneShot` |
 | Button Row 2 (16) | Note | `51` | Reset All Layer Speeds | Sets all 4 layers back to `1.0x` |
 
+> [!NOTE]
+> Notes `48`–`51` finalize the reserved Row 2 buttons in [`SPEC.md`](SPEC.md) §6.3.
+
 ---
 
 ## 5. Keyboard Fallback Reference
@@ -177,7 +182,7 @@ Every MIDI-controlled function can also be performed from the keyboard (matching
 | `Alt + 1-4` | Pause / resume layer 1-4 |
 | `Tab / Shift + Tab` | Focus next / previous layer |
 | `R` | Retrigger focused layer |
-| `Shift + R` | Retrigger all playing layers |
+| `Shift + R` | Retrigger all active layers |
 | `Space` | Pause / resume focused layer |
 | `L` | Toggle loop / one-shot on focused layer |
 | `X` | Clear focused layer |
@@ -200,7 +205,7 @@ Every MIDI-controlled function can also be performed from the keyboard (matching
 | `F8 / Shift + F8` | Contrast + / - (`±0.05`) |
 | `F9 / Shift + F9` | Saturation + / - (`±0.05`) |
 | `F10 / Shift + F10` | Strobe speed + / - (`±2.0 Hz`) |
-| `F12` | Reset all effects |
+| `F12 (Ctrl/Cmd + F12 reserved)` | Reset all effects |
 | `Ctrl + 1 / 2 / 3 / 4` | Toggle RGB shift / glitch / strobe / blackout |
 | `Ctrl + 5-9, Ctrl + 0` | Dimmer (`5`), brightness (`6`), contrast (`7`), saturation (`8`), strobe speed (`9`), reset (`0`) (`Shift` = `-`) |
 | `Ctrl + O or Cmd + O` | Toggle output on / off |
@@ -208,16 +213,42 @@ Every MIDI-controlled function can also be performed from the keyboard (matching
 | `G` | Show / hide the log drawer |
 | `Escape` | Close overlays |
 | `Cmd + Q / Ctrl + Q / Alt + F4` | Request exit (confirmation guard) |
-| `Enter / Escape (in dialog)` | Confirm / cancel exit |
+| `Repeat quit key / Escape (in dialog)` | Confirm / cancel exit |
 
 > [!TIP]
-> On macOS laptops where `F1`–`F12` default to system brightness/media keys, use `Ctrl + 1..0` (`Ctrl + Shift + 5..9` to decrease) and `` ` `` (backtick) for Blackout without needing `Fn`.
+> On macOS laptops where `F1`–`F12` default to system brightness/media keys, press `fn + F1..F12` (or enable *"Use F1, F2, etc. keys as standard function keys"* in **System Settings → Keyboard → Keyboard Shortcuts → Function Keys**), or use `Ctrl + 1..0` (`Ctrl + Shift + 5..9` to decrease) and `` ` `` (backtick) for Blackout without needing `fn`.
+>
+> **Crash-Recovered Sessions**: Restored layers start in `Stopped` state with their `playhead_frame` preserved so live output starts dark and resumes together on `Shift + R` (or MIDI Note `49`).
 
 ---
 
 ## 6. Project File Format (TOML & JSON)
 
 Project files can be passed via `--project <PATH>` or dragged onto the control window. All relative paths (`clip_folder`, `clips`, and `layers[*].clip_path`) are resolved relative to the **project file's parent directory**. If `clips` is non-empty, MUR loads those exact clips in grid order instead of scanning `clip_folder`.
+
+All top-level, `[effects]`, `[output]`, and `[[layers]]` fields are optional (`#[serde(default)]`) and fall back to neutral defaults when omitted. In `[[layers]]`, omitting `clip_path` updates that layer's mix/playback parameters (`playback_mode`, `speed`, `opacity`, `blend_mode`) while **preserving any clip currently active on that layer**. `output.monitor_name` matches either a plain display name (e.g., `"DELL U2720Q"`) or a full monitor ID (`name|WxH|x,y` or `name|WxH|x,y|cg:<id>` on macOS).
+
+### Schema & Clamped Ranges
+
+| Section / Field | Type | Default | Valid / Clamped Range |
+| --- | --- | --- | --- |
+| `clip_folder` | `PathBuf?` | `None` | Directory path (ignored when `clips` is non-empty) |
+| `clips` | `Vec<PathBuf>` | `[]` | Explicit clip paths in grid order |
+| `preferred_midi_port` | `String?` | `None` | Exact or substring port name (`None` = `Auto (LCXL3)`) |
+| `output.monitor_name` | `String?` | `None` | Display name or full monitor ID (`name\|WxH\|x,y[\|cg:<id>]`) |
+| `output.enabled` | `bool` | `false` | Enables or disables the external output window |
+| `effects.rgb_shift_enabled` / `glitch_enabled` / `strobe_enabled` / `blackout` | `bool` | `false` | Effect / blackout enable toggles |
+| `effects.rgb_shift_intensity` / `glitch_intensity` / `strobe_intensity` | `f32` | `0.0` | Clamped to `0.0..=1.0` |
+| `effects.strobe_speed_hz` | `f32` | `8.0` | Clamped to `1.0..=30.0` |
+| `effects.brightness` | `f32` | `0.0` | Clamped to `-1.0..=1.0` |
+| `effects.contrast` / `effects.saturation` | `f32` | `1.0` | Clamped to `0.0..=2.0` |
+| `effects.master_dimmer` | `f32` | `1.0` | Clamped to `0.0..=1.0` |
+| `layers[*].clip_path` | `PathBuf?` | `None` | Omitting keeps the layer's active clip intact |
+| `layers[*].playback_mode` | `String` | `"Loop"` | `"Loop"` \| `"OneShot"` |
+| `layers[*].speed` | `f32` | `1.0` | Clamped to `-2.0..=4.0` |
+| `layers[*].opacity` | `f32` | `1.0` | Clamped to `0.0..=1.0` |
+| `layers[*].blend_mode` | `String` | `"Normal"` | `"Normal"` \| `"Add"` \| `"Multiply"` \| `"Screen"` \| `"Difference"` |
+| `layers[*].playhead_frame` | `f64` | `0.0` | Non-negative frame offset (`>= 0.0`, finite) |
 
 ### TOML Example (`show.toml`)
 
@@ -267,6 +298,7 @@ playback_mode = "OneShot"
 speed = 1.0
 opacity = 0.85
 blend_mode = "Screen"
+playhead_frame = 0.0
 ```
 
 ### JSON Example (`show.json`)

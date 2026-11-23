@@ -11,7 +11,7 @@ MUR combines zero-dependency QuickTime HAP playback, a 4-layer GPU compositor, r
 - **Master Shader Effects & Output Safety**: Single-pass GPU `RGB Shift`, `Glitch`, `Strobe` (`1.0..=30.0 Hz`), color grading (`Brightness`, `Contrast`, `Saturation`), `Master Dimmer`, and instant `Blackout`.
 - **Fixed-Template MIDI + Full Fallback**: Plug-and-play **Novation Launch Control XL 3** mapping on MIDI Channel 1 with background hot-plug auto-reconnect, paired with complete mouse and keyboard control for every function.
 - **Dual-Window Live Setup**: Operator booth UI (`egui` + `wgpu`) with a live 16:9 mirror preview alongside an independent borderless external output window (`1920×1080` internal render target scaled to any display, Space-free overlay over macOS Menu Bar & Dock, DPI-aware borderless fullscreen on Windows).
-- **Stage-Ready Resilience**: Per-layer error isolation, automatic monitor hot-unplug recovery (`WaitingForMonitor`), GPU device-loss rebuild, panic-free Clippy deny rules, `catch_unwind` worker supervision, atomic debounced auto-save/restore (`state.json`), and an exit confirmation guard (`Cmd+Q`, `Ctrl+Q`, `Alt+F4`, Dock Quit, close button).
+- **Stage-Ready Resilience**: Per-layer error isolation, automatic monitor hot-unplug recovery (`WaitingForMonitor`), GPU device-loss rebuild, panic-free Clippy deny rules, `catch_unwind` worker supervision, atomic debounced auto-save/restore (`state.json`), and an exit confirmation guard (`Cmd+Q`, `Ctrl+Q`, `Alt+F4`, Dock Quit, close button, and macOS OS logout/shutdown via `applicationShouldTerminate:`; `Enter` is swallowed—confirm by repeating the quit shortcut or clicking **Quit MUR**, or cancel with `Escape`).
 
 ## Prerequisites & Build
 
