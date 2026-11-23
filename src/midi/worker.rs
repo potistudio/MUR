@@ -22,6 +22,7 @@
 //! loop of the thread that created the MIDI client.
 
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -213,14 +214,36 @@ impl Drop for MidiWorkerHandle {
 	}
 }
 
+/// The operator's current port selection, shared across worker restarts.
+///
+/// Every [`MidiCommand::SelectPort`] updates it — whether the worker applies it
+/// or the supervisor drains it while the worker is down — so a restarted worker
+/// reconnects to the port the UI shows instead of the one MUR started with.
+#[derive(Debug, Clone, Default)]
+struct PortSelection(Arc<Mutex<Option<String>>>);
+
+impl PortSelection {
+	fn new(port: Option<String>) -> Self {
+		Self(Arc::new(Mutex::new(normalize_port(port))))
+	}
+
+	fn get(&self) -> Option<String> {
+		self.0.lock().unwrap_or_else(PoisonError::into_inner).clone()
+	}
+
+	fn set(&self, port: Option<String>) {
+		*self.0.lock().unwrap_or_else(PoisonError::into_inner) = normalize_port(port);
+	}
+}
+
 /// Thread entry point that restarts the worker after a backend panic.
 fn run_supervisor(events: Sender<MidiEvent>, commands: Receiver<MidiCommand>, initial_port: Option<String>) {
-	let last_port = initial_port.clone();
+	let selection = PortSelection::new(initial_port);
 	supervise(
-		|| run_worker(&events, &commands, initial_port.clone()),
+		|| run_worker(&events, &commands, &selection),
 		&events,
 		&commands,
-		last_port,
+		&selection,
 	);
 }
 
@@ -229,12 +252,15 @@ fn run_supervisor(events: Sender<MidiEvent>, commands: Receiver<MidiCommand>, in
 /// Each restart is announced on the event channel together with a
 /// [`MidiConnectionStatus::Reconnecting`] status, so the UI never keeps showing
 /// a stale `Connected` state after the backend crashed. A shutdown request that
-/// arrives while the worker is down wins over the restart.
+/// arrives while the worker is down (including during the backoff) wins over the
+/// restart, and port selections sent meanwhile are recorded in `selection` so the
+/// restarted worker uses them. A restarted worker always rescans immediately, so
+/// pending [`MidiCommand::Rescan`]s need no replay.
 fn supervise(
 	mut worker: impl FnMut(),
 	events: &Sender<MidiEvent>,
 	commands: &Receiver<MidiCommand>,
-	last_port: Option<String>,
+	selection: &PortSelection,
 ) {
 	let mut backoff = RESTART_BACKOFF;
 
@@ -249,14 +275,15 @@ fn supervise(
 		let detail = panic_payload_message(payload);
 		let _ = events.send(MidiEvent::Warning(format!("MIDI worker panicked: {detail}")));
 		let _ = events.send(MidiEvent::StatusChanged(MidiConnectionStatus::Reconnecting {
-			last_port: last_port.clone(),
+			last_port: selection.get(),
 			error: Some(detail),
 		}));
 
 		loop {
 			match commands.try_recv() {
 				Ok(MidiCommand::Shutdown) | Err(TryRecvError::Disconnected) => return,
-				Ok(_) => {}
+				Ok(MidiCommand::SelectPort(port)) => selection.set(port),
+				Ok(MidiCommand::Rescan) => {}
 				Err(TryRecvError::Empty) => break,
 			}
 		}
@@ -272,8 +299,31 @@ fn supervise(
 			"restarting the MIDI worker in {} ms",
 			wait.as_millis()
 		)));
-		std::thread::sleep(wait);
+		if !wait_out_backoff(commands, selection, wait) {
+			return;
+		}
 		backoff = wait.saturating_mul(2).min(MAX_RESTART_BACKOFF);
+	}
+}
+
+/// Sleeps for `wait` while still serving commands.
+///
+/// Returns `false` when a shutdown was requested (or the UI hung up), so the
+/// supervisor stops right away instead of finishing a backoff of up to
+/// [`MAX_RESTART_BACKOFF`] first.
+fn wait_out_backoff(commands: &Receiver<MidiCommand>, selection: &PortSelection, wait: Duration) -> bool {
+	let deadline = Instant::now() + wait;
+	loop {
+		let remaining = deadline.saturating_duration_since(Instant::now());
+		if remaining.is_zero() {
+			return true;
+		}
+		match commands.recv_timeout(remaining) {
+			Ok(MidiCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => return false,
+			Ok(MidiCommand::SelectPort(port)) => selection.set(port),
+			Ok(MidiCommand::Rescan) => {}
+			Err(RecvTimeoutError::Timeout) => return true,
+		}
 	}
 }
 
@@ -289,8 +339,8 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// One run of the worker loop. Returns only on [`MidiCommand::Shutdown`].
-fn run_worker(events: &Sender<MidiEvent>, commands: &Receiver<MidiCommand>, initial_port: Option<String>) {
-	let mut state = WorkerState::new(initial_port);
+fn run_worker(events: &Sender<MidiEvent>, commands: &Receiver<MidiCommand>, selection: &PortSelection) {
+	let mut state = WorkerState::with_selection(selection.clone());
 	let mut scanner: Option<MidiInput> = None;
 	let mut keep_running = true;
 
@@ -430,13 +480,22 @@ struct WorkerState {
 	next_scanner_attempt: Instant,
 	/// Last backend error, used to suppress duplicate warnings.
 	last_error: Option<String>,
+	/// Selection shared with the supervisor, kept in sync with `preferred`.
+	selection: PortSelection,
 }
 
 impl WorkerState {
-	/// Creates the state for one worker run.
+	/// Creates the state for one worker run with a private selection.
+	#[cfg(test)]
 	fn new(preferred: Option<String>) -> Self {
+		Self::with_selection(PortSelection::new(preferred))
+	}
+
+	/// Creates the state for one worker run, starting from the shared selection.
+	fn with_selection(selection: PortSelection) -> Self {
 		Self {
-			preferred: normalize_port(preferred),
+			preferred: selection.get(),
+			selection,
 			ports: Vec::new(),
 			connected: None,
 			status: MidiConnectionStatus::Disconnected,
@@ -468,7 +527,8 @@ impl WorkerState {
 		if self.preferred == port {
 			return;
 		}
-		self.preferred = port;
+		self.preferred = port.clone();
+		self.selection.set(port);
 		self.last_error = None;
 		self.release_connection();
 		self.next_connect_attempt = Instant::now();
@@ -947,7 +1007,7 @@ mod tests {
 			},
 			&tx,
 			&command_rx,
-			Some("Launch Control XL 3".to_string()),
+			&PortSelection::new(Some("Launch Control XL 3".to_string())),
 		);
 
 		assert_eq!(runs.load(Ordering::SeqCst), 2, "the worker is restarted once");
@@ -971,6 +1031,72 @@ mod tests {
 	}
 
 	#[test]
+	fn restarted_worker_uses_the_latest_port_selection() {
+		use std::sync::atomic::{AtomicU32, Ordering};
+
+		let (tx, rx) = crossbeam_channel::unbounded();
+		let (command_tx, command_rx) = crossbeam_channel::unbounded();
+		let selection = PortSelection::new(Some("Port A".to_string()));
+		let runs = AtomicU32::new(0);
+		let seen = Mutex::new(Vec::new());
+
+		supervise(
+			|| {
+				let run = runs.fetch_add(1, Ordering::SeqCst);
+				let mut state = WorkerState::with_selection(selection.clone());
+				seen.lock().unwrap().push(state.preferred.clone());
+				if run == 0 {
+					// The operator picks B, then the backend panics.
+					let (worker_tx, _worker_rx) = crossbeam_channel::unbounded();
+					state.select_port(Some("Port B".to_string()), &worker_tx);
+					// C is selected while the worker is down (drained by the supervisor).
+					command_tx
+						.send(MidiCommand::SelectPort(Some("Port C".to_string())))
+						.unwrap();
+					command_tx.send(MidiCommand::Rescan).unwrap();
+					panic!("simulated CoreMIDI failure");
+				}
+			},
+			&tx,
+			&command_rx,
+			&selection,
+		);
+
+		assert_eq!(runs.load(Ordering::SeqCst), 2);
+		assert_eq!(
+			*seen.lock().unwrap(),
+			vec![Some("Port A".to_string()), Some("Port C".to_string())]
+		);
+		let events: Vec<MidiEvent> = rx.try_iter().collect();
+		assert!(events.iter().any(|event| matches!(
+			event,
+			MidiEvent::StatusChanged(MidiConnectionStatus::Reconnecting { last_port: Some(port), .. })
+				if port == "Port B"
+		)));
+	}
+
+	#[test]
+	fn shutdown_during_the_restart_backoff_stops_immediately() {
+		let (command_tx, command_rx) = crossbeam_channel::unbounded();
+		let selection = PortSelection::default();
+		let sender = std::thread::spawn(move || {
+			std::thread::sleep(Duration::from_millis(50));
+			command_tx
+				.send(MidiCommand::SelectPort(Some("Late".to_string())))
+				.unwrap();
+			command_tx.send(MidiCommand::Shutdown).unwrap();
+		});
+		let started = Instant::now();
+		assert!(!wait_out_backoff(&command_rx, &selection, MAX_RESTART_BACKOFF));
+		assert!(started.elapsed() < MAX_RESTART_BACKOFF / 2);
+		assert_eq!(selection.get().as_deref(), Some("Late"));
+		sender.join().unwrap();
+
+		let (_command_tx, command_rx) = crossbeam_channel::unbounded::<MidiCommand>();
+		assert!(wait_out_backoff(&command_rx, &selection, Duration::from_millis(10)));
+	}
+
+	#[test]
 	fn supervisor_honours_a_pending_shutdown_after_a_panic() {
 		use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -987,7 +1113,7 @@ mod tests {
 			},
 			&tx,
 			&command_rx,
-			None,
+			&PortSelection::default(),
 		);
 
 		assert_eq!(runs.load(Ordering::SeqCst), 1, "the worker must not restart");
