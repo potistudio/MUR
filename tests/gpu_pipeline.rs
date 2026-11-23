@@ -619,6 +619,61 @@ fn aspect_margins_are_black_for_opaque_clips_and_transparent_for_alpha_clips() {
 	assert_ne!(opaque_margin, alpha_margin);
 }
 
+/// Margins are composited with `Normal` regardless of the layer blend mode:
+/// opaque clips paint black bars and alpha clips leave lower layers untouched.
+#[test]
+fn aspect_margins_ignore_the_layer_blend_mode() {
+	let _guard = gpu_lock();
+	let Some(ctx) = gpu_context("aspect_margins_blend") else {
+		return;
+	};
+	let mut renderer = MasterRenderer::new(&ctx).unwrap();
+	let lower = solid_frame(ClipKind::Hap, 64, 36, [0, 255, 0], 255);
+	let opaque_top = solid_frame(ClipKind::Hap, 64, 48, [255, 0, 255], 255);
+	let mut alpha_top = solid_frame(ClipKind::HapAlpha, 64, 48, [255, 0, 255], 255);
+	alpha_top.frame_index = 1;
+	let margin_x = 120;
+	let center_y = INTERNAL_HEIGHT / 2;
+
+	for mode in BlendMode::ALL {
+		for (top, opaque) in [(&opaque_top, true), (&alpha_top, false)] {
+			let layers = [
+				LayerRenderInput {
+					frame: Some(&lower),
+					clip_id: Some(ClipId(23)),
+					opacity: 1.0,
+					blend_mode: BlendMode::Normal,
+					is_opaque_margin: true,
+				},
+				LayerRenderInput {
+					frame: Some(top),
+					clip_id: Some(ClipId(24 + u64::from(top.frame_index))),
+					opacity: 1.0,
+					blend_mode: mode,
+					is_opaque_margin: opaque,
+				},
+				empty_input(),
+				empty_input(),
+			];
+			renderer
+				.render_master(&ctx, &layers, &MasterEffects::default(), 0.0)
+				.unwrap();
+			let pixels = renderer.readback_master_rgba8(&ctx).unwrap();
+			let margin = master_pixel(&pixels, margin_x, center_y);
+			if opaque {
+				assert_eq!(margin, [0, 0, 0, 255], "{mode:?}: opaque clip margins stay black");
+			} else {
+				assert_color(
+					margin,
+					[0.0, 1.0, 0.0],
+					2.0,
+					&format!("{mode:?}: alpha clip margin shows the lower layer"),
+				);
+			}
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Master effects
 // ---------------------------------------------------------------------------

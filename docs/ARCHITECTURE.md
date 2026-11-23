@@ -109,7 +109,7 @@ All GPU rendering shares one `GpuContext` (`wgpu::Backends::PRIMARY`, `PowerPref
    - Inside `src/render/shaders/layer_composite.wgsl`:
      - Samples `src_tex` inside `src_rect` (computed by `fit_rect`) with half-texel UV clamping to avoid bleeding BC block padding.
      - Decodes `is_ycocg != 0` via `ycocg_to_rgb` (`scale = (b * 255/8) + 1`, `co`, `cg`, `y = a`).
-     - Handles margins outside `src_rect`: opaque black (`alpha = opacity`) when `opaque_margin == 1` (`Hap`, `HapQ`, opaque images) or transparent (`alpha = 0.0`) when `opaque_margin == 0` (`HapAlpha`, alpha images).
+     - Handles margins outside `src_rect`: opaque black (`alpha = opacity`) when `opaque_margin == 1` (`Hap`, `HapQ`, opaque images) or transparent (`alpha = 0.0`) when `opaque_margin == 0` (`HapAlpha`, alpha images). Margins are always composited with `Normal`, independent of the layer's blend mode, so an opaque clip's bars stay black under `Add` / `Screen` / `Difference` too.
      - Applies blend modes: `0` Normal, `1` Add, `2` Multiply, `3` Screen, `4` Difference.
 
 3. **Single-Pass Master Effects (`src/render/effects.rs`, `src/render/shaders/master_effects.wgsl`)**:

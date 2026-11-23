@@ -385,6 +385,7 @@ MUR scales each layer to fit inside the `1920×1080` canvas while preserving its
 
 - **Opaque clips** (`Hap`, `HapQ`, and opaque PNG/JPEG): Margins outside the fitted rectangle are filled with **opaque black** (`alpha = 1.0` scaled by layer opacity).
 - **Alpha clips** (`HapAlpha` and PNGs with any pixel `alpha < 255`): Margins outside the fitted rectangle remain **transparent** (`alpha = 0.0`), so non-16:9 overlays, square logos, or vertical graphics never cover lower layers with black bars.
+- **Blend modes do not apply to margins**: The margin strip is always composited as `Normal`, so the same 4:3 opaque clip paints black bars whether its layer uses `Normal`, `Add`, `Multiply`, `Screen`, or `Difference`. Only the fitted picture area uses the layer's blend mode.
 
 ---
 

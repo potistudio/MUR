@@ -83,8 +83,12 @@ fn fs_main(vin: VsOut) -> @location(0) vec4<f32> {
 	src_a = src_a * layer.opacity;
 
 	if (!inside) {
-		src_rgb = vec3<f32>(0.0);
-		src_a = select(0.0, layer.opacity, layer.opaque_margin != 0u);
+		// Margins are always composited with Normal so an opaque clip paints
+		// black bars (and an alpha clip leaves lower layers untouched) under
+		// every blend mode. Otherwise Add / Screen / Difference would treat the
+		// black margin as identity and let lower layers show through.
+		let margin_a = clamp(select(0.0, layer.opacity, layer.opaque_margin != 0u), 0.0, 1.0);
+		return vec4<f32>(mix(dst, vec3<f32>(0.0), margin_a), 1.0);
 	}
 	src_a = clamp(src_a, 0.0, 1.0);
 
