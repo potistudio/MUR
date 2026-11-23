@@ -11,7 +11,8 @@
 //! frames along the playback trajectory into a bounded ring buffer, and discard
 //! stale work via a per-layer `generation` counter. When the exact frame is not
 //! decoded yet, [`LayerStreamer::poll_frame`] serves the nearest buffered frame
-//! of the current generation instead of freezing.
+//! of the current generation behind the playhead (or at most
+//! [`MAX_SERVE_AHEAD`] frame ahead of it) instead of freezing.
 //!
 //! I/O errors, deletion, and unsupported data stop the affected layer at once
 //! and are reported as [`LayerStreamEvent::Error`]. An isolated corrupt frame is
@@ -49,6 +50,14 @@ pub const RENDER_FPS: f32 = 60.0;
 pub const EVENT_CAPACITY: usize = 256;
 /// Frames just behind the playhead that stay buffered, absorbing tick jitter.
 pub const RETAIN_BEHIND: usize = 2;
+/// Furthest a fallback frame may lie *behind* the playhead in [`LayerStreamer::poll_frame`].
+pub const MAX_SERVE_BEHIND: usize = PREFETCH_AHEAD;
+/// Furthest a fallback frame may lie *ahead of* the playhead in [`LayerStreamer::poll_frame`].
+///
+/// Kept at one frame (sub-frame playhead rounding) so an overloaded layer never
+/// jumps into future content; beyond that the renderer holds the previous
+/// frame instead (SPEC §8: skip and hold the previous valid frame).
+pub const MAX_SERVE_AHEAD: usize = 1;
 /// Corrupt or undecodable frames in a row that stop a layer's stream.
 pub const MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
 /// Longest time [`LayerStreamer`]'s `Drop` waits for its workers to exit.
@@ -200,6 +209,16 @@ fn behind_frames(desired: u32, frame_count: u32, speed: f32, mode: PlaybackMode)
 		}
 	}
 	frames
+}
+
+/// Rank of a buffered frame `offset` frames from the playhead as a fallback.
+///
+/// Returns `None` outside the serve window ([`MAX_SERVE_BEHIND`] behind,
+/// [`MAX_SERVE_AHEAD`] ahead) and for the exact frame. Lower ranks win: the
+/// nearest frame first, behind before ahead at the same distance.
+fn fallback_rank(offset: i64) -> Option<(i64, bool)> {
+	let window = -(MAX_SERVE_BEHIND as i64)..=MAX_SERVE_AHEAD as i64;
+	(offset != 0 && window.contains(&offset)).then_some((offset.abs(), offset > 0))
 }
 
 /// Signed distance of `frame` from `desired` in the playback direction.
@@ -608,8 +627,10 @@ impl LayerStreamer {
 	/// decoded yet (decode overload, a skipped corrupt frame), the buffered frame
 	/// of the layer's current generation closest to `desired_frame` is returned,
 	/// preferring frames just behind the playhead over frames ahead of it, within
-	/// [`PREFETCH_AHEAD`] frames. Frames of a cleared or replaced generation are
-	/// never returned. `None` means "keep showing the previous frame".
+	/// [`MAX_SERVE_BEHIND`] frames behind and [`MAX_SERVE_AHEAD`] frame ahead, so
+	/// overload never skips into future content. Frames of a cleared or replaced
+	/// generation are never returned. `None` means "keep showing the previous
+	/// frame".
 	pub fn poll_frame(&self, layer: LayerIndex, clip_id: ClipId, desired_frame: u32) -> Option<Arc<DecodedFrame>> {
 		{
 			let assets = self.assets.read().unwrap_or_else(PoisonError::into_inner);
@@ -642,14 +663,12 @@ impl LayerStreamer {
 		{
 			return Some(Arc::clone(frame));
 		}
-		let max_distance = PREFETCH_AHEAD as i64;
 		ring.entries
 			.iter()
 			.filter(|(id, _)| *id == clip_id)
 			.filter_map(|(_, frame)| {
 				let offset = playback_offset(frame.frame_index, desired_frame, frame_count, forward, mode);
-				// Behind the playhead ranks before ahead at the same distance.
-				(offset != 0 && offset.abs() <= max_distance).then_some(((offset.abs(), offset > 0), frame))
+				fallback_rank(offset).map(|rank| (rank, frame))
 			})
 			.min_by_key(|(rank, _)| *rank)
 			.map(|(_, frame)| Arc::clone(frame))
@@ -1406,6 +1425,23 @@ mod tests {
 			let sample = index.samples[frame];
 			file.seek(SeekFrom::Start(sample.offset)).unwrap();
 			file.write_all(&vec![0xEE; sample.size as usize]).unwrap();
+		}
+	}
+
+	#[test]
+	fn fallback_never_skips_more_than_one_frame_ahead() {
+		assert_eq!(fallback_rank(0), None, "the exact frame is not a fallback");
+		assert_eq!(fallback_rank(-1), Some((1, false)));
+		assert_eq!(fallback_rank(1), Some((1, true)));
+		assert!(fallback_rank(-1) < fallback_rank(1), "behind wins at equal distance");
+		assert!(fallback_rank(1) < fallback_rank(-2), "nearest wins");
+		assert_eq!(
+			fallback_rank(-(MAX_SERVE_BEHIND as i64)),
+			Some((MAX_SERVE_BEHIND as i64, false))
+		);
+		assert_eq!(fallback_rank(-(MAX_SERVE_BEHIND as i64) - 1), None);
+		for ahead in 2..=PREFETCH_AHEAD as i64 {
+			assert_eq!(fallback_rank(ahead), None, "{ahead} frames ahead must not be served");
 		}
 	}
 
