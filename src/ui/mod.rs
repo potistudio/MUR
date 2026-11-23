@@ -39,7 +39,7 @@ pub struct UiState {
 	/// Incremented on winit `HoveredFile`, reset on `HoveredFileCancelled` and
 	/// `DroppedFile`. Any value above zero highlights the media library.
 	pub hovered_files: usize,
-	/// Whether [`apply_vj_theme`] already ran on the current context.
+	/// Whether [`apply_vj_theme`] has been applied at least once by this state.
 	theme_applied: bool,
 	/// Clip whose "×" button was clicked once while it is live, and when.
 	///
@@ -72,12 +72,15 @@ impl UiState {
 		self.theme_applied
 	}
 
-	/// Applies the VJ booth theme to `ctx` the first time it is called.
+	/// Applies the VJ booth theme to `ctx` once per context.
 	pub fn ensure_theme(&mut self, ctx: &egui::Context) {
-		if !self.theme_applied {
+		let key = egui::Id::unique("mur_vj_theme_applied");
+		let already_applied = ctx.data(|data| data.get_temp::<bool>(key).unwrap_or(false));
+		if !already_applied {
 			apply_vj_theme(ctx);
-			self.theme_applied = true;
+			ctx.data_mut(|data| data.insert_temp(key, true));
 		}
+		self.theme_applied = true;
 	}
 
 	/// Uploads missing thumbnails and releases textures of clips that went away.

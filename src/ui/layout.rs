@@ -77,12 +77,26 @@ const FX_STRIP_WIDTH: f32 = 360.0;
 
 // -------------------------------------------------------------------- theme
 
-/// Applies the dark live-performance palette to `ctx`.
+/// Applies the dark live-performance palette and default fonts to `ctx`.
 ///
-/// Forces the dark theme, then restyles it: obsidian panels, slate cards with
-/// hairline borders, a sky-blue focus accent, amber warnings, red errors, and
-/// slightly larger monospace readouts for numeric values. Idempotent.
+/// Installs `egui`'s embedded default fonts with `Hack` added as a fallback
+/// under [`egui::FontFamily::Proportional`] so UI symbols (`●`, `▸`) render
+/// without missing-glyph boxes, then restyles the dark theme: obsidian panels,
+/// slate cards with hairline borders, a sky-blue focus accent, amber warnings,
+/// red errors, and slightly larger monospace readouts for numeric values.
+/// Idempotent.
 pub fn apply_vj_theme(ctx: &egui::Context) {
+	let mut fonts = egui::FontDefinitions::default();
+	if let Some(proportional) = fonts.families.get_mut(&egui::FontFamily::Proportional)
+		&& fonts.font_data.contains_key("Hack")
+		&& !proportional.iter().any(|name| name == "Hack")
+	{
+		// Keep Ubuntu-Light primary and fall back to Hack for symbols (`●`, `▸`)
+		// that Ubuntu-Light does not provide.
+		let insert_at = usize::from(!proportional.is_empty());
+		proportional.insert(insert_at, "Hack".to_owned());
+	}
+	ctx.set_fonts(fonts);
 	ctx.set_theme(Theme::Dark);
 	ctx.style_mut_of(Theme::Dark, configure_style);
 }
@@ -1433,6 +1447,7 @@ mod tests {
 		mirror: Option<TextureId>,
 		frames: usize,
 	) -> Vec<UiCommand> {
+		ctx.set_missing_glyph_policy(egui::MissingGlyphPolicy::Panic);
 		let mut last = Vec::new();
 		for _ in 0..frames {
 			let input = egui::RawInput {
@@ -1664,5 +1679,35 @@ mod tests {
 		assert_eq!(finite_or_zero(f32::INFINITY), 0.0);
 		assert_eq!(fps_color(60.0), GOOD);
 		assert_eq!(fps_color(f32::NAN), TEXT_DIM);
+	}
+
+	#[test]
+	fn all_ui_text_and_symbols_have_installed_glyphs() {
+		let defaults = egui::FontDefinitions::default();
+		assert!(
+			!defaults.font_data.is_empty(),
+			"egui default_fonts must embed built-in font data"
+		);
+
+		let ctx = egui::Context::default();
+		apply_vj_theme(&ctx);
+		ctx.set_missing_glyph_policy(egui::MissingGlyphPolicy::Panic);
+
+		let mut samples: Vec<String> =
+			vec!["MUR ● LIVE 1920×1080 · 60.0 fps · 16.7 ms — / — Next ▸ clip × ×? Loading… –".to_owned()];
+		for entry in SHORTCUT_LEGEND {
+			samples.push(entry.keys.to_owned());
+			samples.push(entry.description.to_owned());
+		}
+
+		let output = ctx.run_pass(egui::RawInput::default(), |ctx| {
+			ctx.fonts_mut(|fonts| {
+				for sample in &samples {
+					let _ = fonts.layout_no_wrap(sample.clone(), FontId::proportional(14.0), TEXT);
+					let _ = fonts.layout_no_wrap(sample.clone(), FontId::monospace(12.5), TEXT);
+				}
+			});
+		});
+		output.drop_without_applying_deltas();
 	}
 }
