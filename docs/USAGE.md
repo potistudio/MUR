@@ -30,7 +30,7 @@ cargo run --release -- [OPTIONS]
 3. If `--folder` is supplied, supported media files in that directory are appended to the clip library.
 
 > [!IMPORTANT]
-> **Safe Crash/Restart Recovery**: Restored clips and layers always come back in the `STOPPED` state (with their restored opacity, blend mode, speed, playback mode, and playhead position ready). Live output never starts moving on its own after a restart until you trigger or unpause a layer.
+> **Safe Crash/Restart Recovery**: Restored clips and layers always come back in the `STOPPED` state (with their restored opacity, blend mode, speed, playback mode, and playhead position ready). Live output never starts moving on its own after a restart until you trigger or unpause a layer. A clip that was only *selected* on a layer (never triggered) is restored as the selection only, so the layer stays empty and a stray pause key cannot start it.
 
 ---
 

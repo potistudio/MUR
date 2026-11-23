@@ -138,6 +138,11 @@ pub struct PendingBinding {
 	pub path: PathBuf,
 	/// Playhead to restore, in clip frames.
 	pub playhead_frame: f64,
+	/// Keep the layer's current selection when binding instead of selecting the clip.
+	///
+	/// Set when restoring a persisted session, whose selection is restored separately
+	/// and may differ from the active clip.
+	pub keep_selection: bool,
 }
 
 /// What [`ClipLibrary::complete`] changed.
@@ -304,7 +309,14 @@ impl ClipLibrary {
 					.partition(|binding| binding.path == path);
 				self.pending_bindings = waiting;
 				for binding in ready {
+					let selection = state.layer(binding.layer).selected_clip;
 					if bind_layer_to_clip(state, binding.layer, clip_id, binding.playhead_frame) {
+						if binding.keep_selection
+							&& selection.is_some()
+							&& let Some(layer) = state.layer_mut(binding.layer)
+						{
+							layer.selected_clip = selection;
+						}
 						set_flag(&mut outcome.bound_layers, binding.layer.index());
 					}
 				}
@@ -474,7 +486,17 @@ pub fn apply_persisted_state(
 				layer,
 				path: path.to_path_buf(),
 				playhead_frame: layer_state.playhead_frame,
+				keep_selection: true,
 			});
+		}
+		// The selection does not need the clip to be loaded: its slot id is known as
+		// soon as it is queued. A selection-only clip never becomes active.
+		if let Some(path) = layer_state.selected_clip_path.as_deref() {
+			requests.extend(library.enqueue(state, path));
+			let selected = state.clips.iter().find(|clip| clip.path == path).map(|clip| clip.id);
+			if let Some(state_layer) = state.layer_mut(layer) {
+				state_layer.selected_clip = selected;
+			}
 		}
 	}
 	state.dirty = false;
@@ -566,6 +588,7 @@ pub fn apply_project(
 				layer,
 				path: path.to_path_buf(),
 				playhead_frame: settings.playhead_frame,
+				keep_selection: false,
 			}),
 		}
 	}
@@ -2612,6 +2635,57 @@ mod tests {
 	}
 
 	#[test]
+	fn restored_selection_stays_selection_only_and_survives_the_active_binding() {
+		let mut persisted = PersistedState::default();
+		// Layer 1: selected only. Layer 2: active A with B selected.
+		persisted.layers[0].selected_clip_path = Some(PathBuf::from("/media/b.mov"));
+		persisted.layers[1].clip_path = Some(PathBuf::from("/media/a.mov"));
+		persisted.layers[1].selected_clip_path = Some(PathBuf::from("/media/b.mov"));
+
+		let mut state = AppState::default();
+		let mut library = ClipLibrary::new();
+		let requests = apply_persisted_state(&mut state, &mut library, &persisted);
+		assert_eq!(requests.len(), 2);
+		let a = requests
+			.iter()
+			.find(|r| r.path == Path::new("/media/a.mov"))
+			.unwrap()
+			.clone();
+		let b = requests
+			.iter()
+			.find(|r| r.path == Path::new("/media/b.mov"))
+			.unwrap()
+			.clone();
+		assert_eq!(library.pending_bindings().len(), 1, "only the active clip is bound");
+		assert_eq!(state.layers[0].selected_clip, Some(b.clip_id));
+		assert_eq!(state.layers[0].active_clip, None);
+
+		for (request, frames) in [(&b, 10), (&a, 20)] {
+			let path = request.path.to_string_lossy().into_owned();
+			library.complete(
+				&mut state,
+				request.clip_id,
+				&request.path,
+				Ok(loaded_info(&path, frames, 30.0)),
+			);
+		}
+		assert_eq!(
+			state.layers[0].active_clip, None,
+			"selection-only clip is never activated"
+		);
+		assert!(!state.toggle_pause_layer(LayerIndex::ALL[0]));
+		assert_eq!(state.layers[1].active_clip, Some(a.clip_id));
+		assert_eq!(state.layers[1].selected_clip, Some(b.clip_id));
+
+		let snapshot = capture_persisted(&state, &library);
+		assert_eq!(snapshot.layers[0].clip_path, None);
+		assert_eq!(
+			snapshot.layers[0].selected_clip_path,
+			Some(PathBuf::from("/media/b.mov"))
+		);
+	}
+
+	#[test]
 	fn persisted_layer_binding_is_fulfilled_and_hydrated_on_load() {
 		let mut persisted = PersistedState {
 			clip_paths: vec![PathBuf::from("/media/a.mov")],
@@ -2619,6 +2693,7 @@ mod tests {
 		};
 		persisted.layers[1] = PersistedLayerState {
 			clip_path: Some(PathBuf::from("/media/a.mov")),
+			selected_clip_path: None,
 			playback_mode: PlaybackMode::OneShot,
 			speed: 2.0,
 			opacity: 0.4,
@@ -2701,6 +2776,7 @@ mod tests {
 			layer: LayerIndex::ALL[2],
 			path: PathBuf::from("/media/bad.mov"),
 			playhead_frame: 0.0,
+			keep_selection: false,
 		});
 		state.trigger_clip_on_layer(LayerIndex::ALL[3], bad.clip_id);
 
@@ -2734,6 +2810,7 @@ mod tests {
 			layer: LayerIndex::ALL[0],
 			path: PathBuf::from("/media/c.mov"),
 			playhead_frame: 0.0,
+			keep_selection: false,
 		});
 		let outcome = apply_session_command(&mut state, &mut library, &UiCommand::RemoveClip(request.clip_id));
 		assert_eq!(outcome.remove_clip, Some(request.clip_id));
@@ -2766,6 +2843,7 @@ mod tests {
 			layer: LayerIndex::ALL[0],
 			path: PathBuf::from("/media/restored.mov"),
 			playhead_frame: 3.0,
+			keep_selection: false,
 		});
 		state.trigger_clip_on_layer(LayerIndex::ALL[0], other.clip_id);
 
@@ -2884,6 +2962,7 @@ mod tests {
 			layer: LayerIndex::ALL[1],
 			path: PathBuf::from("/media/x.mov"),
 			playhead_frame: 0.0,
+			keep_selection: false,
 		});
 		let outcome = apply_session_command(&mut state, &mut library, &UiCommand::ClearLayer(LayerIndex::ALL[1]));
 		assert!(outcome.was_cleared(LayerIndex::ALL[1]));

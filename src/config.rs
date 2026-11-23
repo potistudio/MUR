@@ -169,8 +169,15 @@ impl ProjectConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistedLayerState {
-	/// Path of the clip that was active on this layer.
+	/// Path of the clip that was active (triggered) on this layer.
 	pub clip_path: Option<PathBuf>,
+	/// Path of the clip that was selected on this layer.
+	///
+	/// Kept apart from [`Self::clip_path`] so a clip that was only selected is
+	/// never restored as the active clip: an untriggered layer must stay empty
+	/// after a restart, and a stray pause key must not start it. `None` falls
+	/// back to the active clip.
+	pub selected_clip_path: Option<PathBuf>,
 	/// Loop or one-shot behaviour.
 	pub playback_mode: PlaybackMode,
 	/// Playback speed in `-2.0..=4.0`.
@@ -187,6 +194,7 @@ impl Default for PersistedLayerState {
 	fn default() -> Self {
 		Self {
 			clip_path: None,
+			selected_clip_path: None,
 			playback_mode: PlaybackMode::Loop,
 			speed: 1.0,
 			opacity: 1.0,
@@ -197,10 +205,13 @@ impl Default for PersistedLayerState {
 }
 
 impl PersistedLayerState {
-	/// Captures a live layer, storing the clip path instead of the runtime id.
-	pub fn capture(layer: &LayerState, clip_path: Option<PathBuf>) -> Self {
+	/// Captures a live layer, storing clip paths instead of runtime ids.
+	///
+	/// `clip_path` is the active clip and `selected_clip_path` the selected one.
+	pub fn capture(layer: &LayerState, clip_path: Option<PathBuf>, selected_clip_path: Option<PathBuf>) -> Self {
 		Self {
 			clip_path,
+			selected_clip_path,
 			playback_mode: layer.playback_mode,
 			speed: layer.speed,
 			opacity: layer.opacity,
@@ -209,15 +220,20 @@ impl PersistedLayerState {
 		}
 	}
 
-	/// Rebuilds a layer, binding `clip` when the persisted path could be resolved.
+	/// Rebuilds a layer, binding `clip` (the active clip) when the persisted path
+	/// could be resolved.
+	///
+	/// `selected` is the resolved [`Self::selected_clip_path`]; when it is `None`
+	/// the selection falls back to the active clip. A selection-only clip is
+	/// never made active.
 	///
 	/// The persisted playhead is restored so the operator returns to the frame
 	/// they left, but the layer stays [`PlaybackState::Stopped`](crate::model::PlaybackState::Stopped): live output must
 	/// never start moving on its own after a crash recovery. Invalid playhead
 	/// values (negative or non-finite) fall back to frame `0`.
-	pub fn restore(&self, clip: Option<ClipId>) -> LayerState {
+	pub fn restore(&self, clip: Option<ClipId>, selected: Option<ClipId>) -> LayerState {
 		let mut layer = LayerState {
-			selected_clip: clip,
+			selected_clip: selected.or(clip),
 			active_clip: clip,
 			playback_mode: self.playback_mode,
 			blend_mode: self.blend_mode,
@@ -236,6 +252,9 @@ impl PersistedLayerState {
 	/// Resolves the persisted clip path against `base_dir`.
 	pub fn resolve_paths(&mut self, base_dir: &Path) {
 		if let Some(path) = self.clip_path.as_mut() {
+			*path = resolve_relative(path, base_dir);
+		}
+		if let Some(path) = self.selected_clip_path.as_mut() {
 			*path = resolve_relative(path, base_dir);
 		}
 	}
@@ -290,12 +309,9 @@ impl PersistedState {
 			app.layers
 				.get(index)
 				.map_or_else(PersistedLayerState::default, |layer| {
-					let clip_path = layer
-						.active_clip
-						.or(layer.selected_clip)
-						.and_then(|id| app.clip_by_id(id))
-						.map(|clip| clip.path.clone());
-					PersistedLayerState::capture(layer, clip_path)
+					let path_of =
+						|id: Option<ClipId>| id.and_then(|id| app.clip_by_id(id)).map(|clip| clip.path.clone());
+					PersistedLayerState::capture(layer, path_of(layer.active_clip), path_of(layer.selected_clip))
 				})
 		});
 
@@ -326,8 +342,9 @@ impl PersistedState {
 
 		for (index, persisted) in self.layers.iter().enumerate() {
 			let clip = persisted.clip_path.as_deref().and_then(&mut resolve_clip);
+			let selected = persisted.selected_clip_path.as_deref().and_then(&mut resolve_clip);
 			if let Some(layer) = app.layers.get_mut(index) {
-				*layer = persisted.restore(clip);
+				*layer = persisted.restore(clip, selected);
 			}
 		}
 
@@ -722,6 +739,48 @@ mod tests {
 	}
 
 	#[test]
+	fn selected_only_clip_is_not_restored_as_active() {
+		let mut app = AppState::default();
+		app.upsert_clip(clip(1, "/media/selected.mov"));
+		app.upsert_clip(clip(2, "/media/active.mov"));
+		// Layer 1: selected but never triggered. Layer 2: active, then another clip selected.
+		app.layers[0].selected_clip = Some(ClipId(1));
+		app.layers[1].active_clip = Some(ClipId(2));
+		app.layers[1].selected_clip = Some(ClipId(1));
+
+		let state = PersistedState::capture(&app);
+		assert_eq!(state.layers[0].clip_path, None);
+		assert_eq!(
+			state.layers[0].selected_clip_path,
+			Some(PathBuf::from("/media/selected.mov"))
+		);
+		assert_eq!(state.layers[1].clip_path, Some(PathBuf::from("/media/active.mov")));
+		assert_eq!(
+			state.layers[1].selected_clip_path,
+			Some(PathBuf::from("/media/selected.mov"))
+		);
+
+		let json = serde_json::to_string(&state).unwrap();
+		let state: PersistedState = serde_json::from_str(&json).unwrap();
+		let mut restored = AppState::default();
+		state.restore_into(&mut restored, |path| match path.to_str() {
+			Some("/media/selected.mov") => Some(ClipId(1)),
+			Some("/media/active.mov") => Some(ClipId(2)),
+			_ => None,
+		});
+		assert_eq!(restored.layers[0].active_clip, None);
+		assert_eq!(restored.layers[0].selected_clip, Some(ClipId(1)));
+		// A pause key on the untriggered layer must not start the selected clip.
+		assert!(!restored.toggle_pause_layer(LayerIndex::ALL[0]));
+		assert_eq!(restored.layers[1].active_clip, Some(ClipId(2)));
+		assert_eq!(restored.layers[1].selected_clip, Some(ClipId(1)));
+
+		// Older files without `selected_clip_path` select the active clip.
+		let legacy: PersistedLayerState = serde_json::from_str(r#"{"clip_path":"/media/active.mov"}"#).unwrap();
+		assert_eq!(legacy.restore(Some(ClipId(2)), None).selected_clip, Some(ClipId(2)));
+	}
+
+	#[test]
 	fn load_state_returns_none_for_missing_file() {
 		let path = temp_path("missing").join("state.json");
 		assert!(load_state(&path).unwrap().is_none());
@@ -800,13 +859,17 @@ mod tests {
 		state.layers[0].clip_path = Some(PathBuf::from("/media/intro.mov"));
 		state.layers[0].playhead_frame = 37.5;
 
-		let restored = state.layers[0].restore(Some(ClipId(1)));
+		let restored = state.layers[0].restore(Some(ClipId(1)), None);
 		assert_eq!(restored.playhead_frame, 37.5);
 		assert_eq!(restored.playback_state, PlaybackState::Stopped);
 
 		for bad in [-1.0, f64::NAN, f64::INFINITY] {
 			state.layers[0].playhead_frame = bad;
-			assert_eq!(state.layers[0].restore(Some(ClipId(1))).playhead_frame, 0.0, "{bad}");
+			assert_eq!(
+				state.layers[0].restore(Some(ClipId(1)), None).playhead_frame,
+				0.0,
+				"{bad}"
+			);
 		}
 	}
 
