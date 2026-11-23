@@ -71,7 +71,7 @@ MUR avoids FFmpeg and external native codecs entirely. Every media format is val
 - Walks top-level ISO-BMFF/QuickTime boxes via `Seek` without reading `mdat` payloads into memory (bounded by `MAX_TOP_LEVEL_BOXES = 100_000` and `MAX_MOOV_BYTES = 512 MiB`).
 - Loads only the `moov` box and inspects `trak` children:
   - Non-video tracks (`hdlr` subtype != `vide`, e.g., audio and timecode) are ignored.
-  - Sample descriptions (`stsd`) map `Hap1` → `ClipKind::Hap`, `Hap5` → `ClipKind::HapAlpha`, and `HapY` → `ClipKind::HapQ`. Unsupported variants (`HapM`, `HapA`, or other codecs) and compressed `cmov` headers return `MediaError::UnsupportedFormat`.
+  - Sample descriptions (`stsd`) map `Hap1` → `ClipKind::Hap`, `Hap5` → `ClipKind::HapAlpha`, and `HapY` → `ClipKind::HapQ`. With several entries the first HAP entry is used (non-HAP entries such as previews are skipped), and every `stsc` run must reference that entry; a track mixing HAP with another codec is rejected. Unsupported variants (`HapM`, `HapA`, or other codecs) and compressed `cmov` headers return `MediaError::UnsupportedFormat`.
   - Builds a `Vec<MovSample>` (absolute `offset: u64` + `size: u32`) from `stsz`, `stsc`, and either `stco` (32-bit offsets) or `co64` (64-bit offsets), bounds-checked against file length and `MAX_SAMPLE_COUNT = 10_000_000` / `MAX_SAMPLE_BYTES = 256 MiB`.
   - Derives frame rate from `mdhd` timescale and `stts` durations, falling back to `FALLBACK_FPS = 60.0`.
 

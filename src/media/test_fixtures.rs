@@ -298,6 +298,11 @@ pub struct HapMovFixture {
 	pub omit_stts: bool,
 	/// Override every `stsz` sample size with this value.
 	pub sample_size_override: Option<u32>,
+	/// Insert a sample description with this FourCC before the HAP one, making
+	/// HAP the second `stsd` entry (and the default `stsc` description index 2).
+	pub leading_stsd_entry: Option<[u8; 4]>,
+	/// Override the `stsc` sample description index of every chunk run.
+	pub stsc_description_index: Option<u32>,
 }
 
 impl HapMovFixture {
@@ -326,6 +331,8 @@ impl HapMovFixture {
 			stsc_first_chunk: None,
 			omit_stts: false,
 			sample_size_override: None,
+			leading_stsd_entry: None,
+			stsc_description_index: None,
 		}
 	}
 
@@ -500,8 +507,14 @@ fn dinf() -> Vec<u8> {
 }
 
 fn stsd(entry_type: &[u8; 4], entry_body: &[u8]) -> Vec<u8> {
-	let mut body = 1u32.to_be_bytes().to_vec();
-	body.extend(mov_box(entry_type, entry_body));
+	stsd_entries(&[(*entry_type, entry_body)])
+}
+
+fn stsd_entries(entries: &[([u8; 4], &[u8])]) -> Vec<u8> {
+	let mut body = u32::try_from(entries.len()).unwrap_or(0).to_be_bytes().to_vec();
+	for (entry_type, entry_body) in entries {
+		body.extend(mov_box(entry_type, entry_body));
+	}
 	full_box(b"stsd", 0, 0, &body)
 }
 
@@ -536,7 +549,7 @@ fn stsz(sizes: &[u32]) -> Result<Vec<u8>, MediaError> {
 	Ok(full_box(b"stsz", 0, 0, &body))
 }
 
-fn stsc(sample_count: u32, samples_per_chunk: u32, first_chunk: u32) -> (Vec<u8>, u32) {
+fn stsc(sample_count: u32, samples_per_chunk: u32, first_chunk: u32, description_index: u32) -> (Vec<u8>, u32) {
 	let per_chunk = samples_per_chunk.max(1);
 	let chunk_count = sample_count.div_ceil(per_chunk);
 	let remainder = sample_count % per_chunk;
@@ -553,7 +566,7 @@ fn stsc(sample_count: u32, samples_per_chunk: u32, first_chunk: u32) -> (Vec<u8>
 	for (first, per) in entries {
 		body.extend(first.to_be_bytes());
 		body.extend(per.to_be_bytes());
-		body.extend(1u32.to_be_bytes());
+		body.extend(description_index.to_be_bytes());
 	}
 	(full_box(b"stsc", 0, 0, &body), chunk_count)
 }
@@ -583,7 +596,15 @@ fn video_trak(fixture: &HapMovFixture, frames: &[Vec<u8>], payload_start: u64) -
 		})
 		.collect::<Result<Vec<u32>, MediaError>>()?;
 	let count = len_u32(sizes.len())?;
-	let (stsc_box, chunk_count) = stsc(count, fixture.samples_per_chunk, fixture.stsc_first_chunk.unwrap_or(1));
+	let description_index = fixture
+		.stsc_description_index
+		.unwrap_or(if fixture.leading_stsd_entry.is_some() { 2 } else { 1 });
+	let (stsc_box, chunk_count) = stsc(
+		count,
+		fixture.samples_per_chunk,
+		fixture.stsc_first_chunk.unwrap_or(1),
+		description_index,
+	);
 	let per_chunk = usize::try_from(fixture.samples_per_chunk.max(1)).unwrap_or(1);
 	let mut offsets = Vec::new();
 	let mut running = payload_start;
@@ -620,8 +641,12 @@ fn video_trak(fixture: &HapMovFixture, frames: &[Vec<u8>], payload_start: u64) -
 	entry.extend(24u16.to_be_bytes());
 	entry.extend(0xFFFFu16.to_be_bytes());
 
+	let stsd_box = match fixture.leading_stsd_entry {
+		Some(leading) => stsd_entries(&[(leading, &entry), (fixture.fourcc(), &entry)]),
+		None => stsd(&fixture.fourcc(), &entry),
+	};
 	let mut stbl_parts = vec![
-		stsd(&fixture.fourcc(), &entry),
+		stsd_box,
 		stsc_box,
 		stsz(&sizes)?,
 		chunk_offset_box(&offsets, fixture.use_co64)?,
@@ -656,7 +681,7 @@ fn audio_trak(fixture: &HapMovFixture, offset: u64) -> Result<Vec<u8>, MediaErro
 		&concat(&[
 			stsd(b"sowt", &entry),
 			stts(1, 4),
-			stsc(1, 1, 1).0,
+			stsc(1, 1, 1, 1).0,
 			stsz(&[len_u32(AUDIO_SAMPLE.len())?])?,
 			chunk_offset_box(&[offset], fixture.use_co64)?,
 		]),

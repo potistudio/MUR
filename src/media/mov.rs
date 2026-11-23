@@ -436,11 +436,12 @@ fn parse_trak(trak: &[u8], file_len: u64) -> ParseResult<TrackOutcome> {
 	let stbl = require_child(minf, b"stbl", "minf")?;
 
 	let stsd = require_child(stbl, b"stsd", "stbl")?;
-	let (kind, width, height) = match parse_stsd(stsd) {
+	let description = match parse_stsd(stsd) {
 		Ok(description) => description,
 		Err(error @ ParseError::Unsupported(_)) => return Ok(TrackOutcome::UnsupportedVideo(error)),
 		Err(error) => return Err(error),
 	};
+	let (kind, width, height) = (description.kind, description.width, description.height);
 
 	let sample_sizes = parse_stsz(require_child(stbl, b"stsz", "stbl")?)?;
 	let chunk_offsets = match find_child(stbl, b"stco")? {
@@ -451,6 +452,18 @@ fn parse_trak(trak: &[u8], file_len: u64) -> ParseResult<TrackOutcome> {
 		},
 	};
 	let stsc = parse_stsc(require_child(stbl, b"stsc", "stbl")?)?;
+	// With several sample descriptions, every chunk must use the HAP one: a
+	// track that mixes HAP with another codec cannot be streamed frame by frame.
+	// A single description keeps the historical behaviour of ignoring the index.
+	if description.entry_count > 1
+		&& stsc
+			.iter()
+			.any(|entry| entry.sample_description_index != description.index)
+	{
+		return Ok(TrackOutcome::UnsupportedVideo(ParseError::Unsupported(
+			"video track mixes HAP and non-HAP sample descriptions".into(),
+		)));
+	}
 	let samples = build_samples(&sample_sizes, &chunk_offsets, &stsc, file_len)?;
 	let fps = match find_child(stbl, b"stts")? {
 		Some(stts) => compute_fps(timescale, stts)?,
@@ -495,7 +508,23 @@ pub fn clip_kind_from_fourcc(code: [u8; 4]) -> Result<ClipKind, MediaError> {
 	}
 }
 
-fn parse_stsd(stsd: &[u8]) -> ParseResult<(ClipKind, u32, u32)> {
+/// The HAP sample description chosen from a track's `stsd`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SampleDescription {
+	/// 1-based index of the entry, as referenced by `stsc`.
+	index: u32,
+	/// Number of entries the `stsd` declares.
+	entry_count: u32,
+	kind: ClipKind,
+	width: u32,
+	height: u32,
+}
+
+/// Picks the first HAP entry of `stsd`.
+///
+/// Non-HAP entries before it (e.g. a preview or alternate codec) are skipped.
+/// When no entry is HAP, the first entry's "unsupported" error is returned.
+fn parse_stsd(stsd: &[u8]) -> ParseResult<SampleDescription> {
 	let entry_count = read_u32(stsd, 4)?;
 	if entry_count == 0 {
 		return corrupt("stsd has no sample descriptions");
@@ -503,21 +532,32 @@ fn parse_stsd(stsd: &[u8]) -> ParseResult<(ClipKind, u32, u32)> {
 	let entries = stsd
 		.get(8..)
 		.ok_or_else(|| ParseError::Corrupt("stsd is truncated".into()))?;
-	let Some(first) = BoxIter::new(entries).next() else {
-		return corrupt("stsd has no sample descriptions");
-	};
-	let (format, description) = first?;
-	let kind = clip_kind_from_fourcc(format).map_err(|error| match error {
-		MediaError::UnsupportedFormat(detail) => ParseError::Unsupported(detail),
-		other => ParseError::Corrupt(other.to_string()),
-	})?;
-	// reserved(6) dref(2) version(2) revision(2) vendor(4) temporal(4) spatial(4) width(2) height(2)
-	let width = u32::from(read_u16(description, 24)?);
-	let height = u32::from(read_u16(description, 26)?);
-	if !dimensions_are_valid(width, height) {
-		return corrupt(format!("invalid frame dimensions {width}x{height}"));
+	let mut first_unsupported = None;
+	for (position, entry) in (1..=entry_count).zip(BoxIter::new(entries)) {
+		let (format, description) = entry?;
+		let kind = match clip_kind_from_fourcc(format) {
+			Ok(kind) => kind,
+			Err(MediaError::UnsupportedFormat(detail)) => {
+				first_unsupported.get_or_insert(ParseError::Unsupported(detail));
+				continue;
+			}
+			Err(other) => return Err(ParseError::Corrupt(other.to_string())),
+		};
+		// reserved(6) dref(2) version(2) revision(2) vendor(4) temporal(4) spatial(4) width(2) height(2)
+		let width = u32::from(read_u16(description, 24)?);
+		let height = u32::from(read_u16(description, 26)?);
+		if !dimensions_are_valid(width, height) {
+			return corrupt(format!("invalid frame dimensions {width}x{height}"));
+		}
+		return Ok(SampleDescription {
+			index: position,
+			entry_count,
+			kind,
+			width,
+			height,
+		});
 	}
-	Ok((kind, width, height))
+	Err(first_unsupported.unwrap_or_else(|| ParseError::Corrupt("stsd has no sample descriptions".into())))
 }
 
 fn parse_stsz(stsz: &[u8]) -> ParseResult<Vec<u32>> {
@@ -581,6 +621,8 @@ fn parse_co64(co64: &[u8]) -> ParseResult<Vec<u64>> {
 struct StscEntry {
 	first_chunk: u32,
 	samples_per_chunk: u32,
+	/// 1-based `stsd` entry the chunks use.
+	sample_description_index: u32,
 }
 
 fn parse_stsc(stsc: &[u8]) -> ParseResult<Vec<StscEntry>> {
@@ -597,6 +639,7 @@ fn parse_stsc(stsc: &[u8]) -> ParseResult<Vec<StscEntry>> {
 			Ok(StscEntry {
 				first_chunk: read_u32(bytes, 0)?,
 				samples_per_chunk: read_u32(bytes, 4)?,
+				sample_description_index: read_u32(bytes, 8)?,
 			})
 		})
 		.collect::<ParseResult<Vec<StscEntry>>>()?;
@@ -772,6 +815,35 @@ mod tests {
 		fixture.moov_first = true;
 		fixture.mdat_size_zero = true;
 		assert_eq!(parse(&fixture).unwrap().frame_count(), 3);
+	}
+
+	#[test]
+	fn picks_the_hap_entry_among_several_sample_descriptions() {
+		let mut fixture = HapMovFixture::new(ClipKind::HapAlpha, 8, 8, 4);
+		fixture.leading_stsd_entry = Some(*b"avc1");
+		let index = parse(&fixture).unwrap();
+		assert_eq!(index.kind, ClipKind::HapAlpha);
+		assert_eq!((index.width, index.height), (8, 8));
+		assert_eq!(index.frame_count(), 4);
+
+		// Chunks that use the non-HAP description cannot be streamed.
+		fixture.stsc_description_index = Some(1);
+		assert!(matches!(parse(&fixture), Err(MediaError::UnsupportedFormat(_))));
+
+		// Without any HAP entry the first codec is reported as unsupported.
+		let mut fixture = HapMovFixture::new(ClipKind::Hap, 8, 8, 2);
+		fixture.leading_stsd_entry = Some(*b"avc1");
+		fixture.codec_override = Some(*b"mp4v");
+		let error = parse(&fixture).unwrap_err();
+		assert!(
+			matches!(&error, MediaError::UnsupportedFormat(detail) if detail.contains("avc1")),
+			"{error:?}"
+		);
+
+		// A single description keeps ignoring the stsc index, as before.
+		let mut fixture = HapMovFixture::new(ClipKind::Hap, 8, 8, 2);
+		fixture.stsc_description_index = Some(0);
+		assert_eq!(parse(&fixture).unwrap().frame_count(), 2);
 	}
 
 	#[test]
