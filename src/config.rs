@@ -375,7 +375,34 @@ where
 	Ok(layers)
 }
 
+/// Deletes a temporary file when dropped unless [`TempFileGuard::disarm`] was called.
+struct TempFileGuard<'a> {
+	path: &'a Path,
+	armed: bool,
+}
+
+impl<'a> TempFileGuard<'a> {
+	fn new(path: &'a Path) -> Self {
+		Self { path, armed: true }
+	}
+
+	/// Keeps the file: it was renamed into place.
+	fn disarm(&mut self) {
+		self.armed = false;
+	}
+}
+
+impl Drop for TempFileGuard<'_> {
+	fn drop(&mut self) {
+		if self.armed {
+			let _ = std::fs::remove_file(self.path);
+		}
+	}
+}
+
 /// Writes `state` to `path` through a sibling `.tmp` file and an atomic rename.
+///
+/// The temporary file is removed whenever the save fails after creating it.
 pub fn save_state_atomic(path: &Path, state: &PersistedState) -> Result<(), ConfigError> {
 	let json = serde_json::to_string_pretty(state).map_err(|error| ConfigError::Serialize {
 		path: path.display().to_string(),
@@ -387,16 +414,18 @@ pub fn save_state_atomic(path: &Path, state: &PersistedState) -> Result<(), Conf
 	}
 
 	let temp_path = sibling_temp_path(path);
+	// Removes the temp file on every early return (create, write, fsync, or
+	// rename failure), so repeated failed autosaves during a long show (e.g. a
+	// full disk) never pile up `.tmp-{pid}-{seq}` files.
+	let mut temp_guard = TempFileGuard::new(&temp_path);
 	let mut file = std::fs::File::create(&temp_path).map_err(|error| ConfigError::io(&temp_path, error))?;
 	file.write_all(json.as_bytes())
 		.map_err(|error| ConfigError::io(&temp_path, error))?;
 	file.sync_all().map_err(|error| ConfigError::io(&temp_path, error))?;
 	drop(file);
 
-	std::fs::rename(&temp_path, path).map_err(|error| {
-		let _ = std::fs::remove_file(&temp_path);
-		ConfigError::io(path, error)
-	})?;
+	std::fs::rename(&temp_path, path).map_err(|error| ConfigError::io(path, error))?;
+	temp_guard.disarm();
 
 	// POSIX only guarantees that a rename is durable once the containing
 	// directory has been flushed; this is best effort and never fails a save.
@@ -888,6 +917,38 @@ mod tests {
 		saver.mark_dirty();
 		assert!(!saver.is_due(now + Duration::from_millis(100)));
 		assert!(saver.is_due(now + Duration::from_millis(600)));
+	}
+
+	#[test]
+	fn failed_saves_leave_no_temp_files_behind() {
+		let dir = temp_path("failed-save");
+		std::fs::create_dir_all(&dir).unwrap();
+		// Renaming a file onto an existing directory fails after the temp file
+		// was written, which exercises the late-failure cleanup path.
+		let target = dir.join("state.json");
+		std::fs::create_dir_all(target.join("occupied")).unwrap();
+		for _ in 0..3 {
+			assert!(save_state_atomic(&target, &PersistedState::default()).is_err());
+		}
+		let leftovers: Vec<_> = std::fs::read_dir(&dir)
+			.unwrap()
+			.filter_map(Result::ok)
+			.map(|entry| entry.file_name().to_string_lossy().into_owned())
+			.filter(|name| name.contains(".tmp-"))
+			.collect();
+		assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+
+		// The guard removes the file on drop and keeps it once disarmed.
+		let kept = dir.join("kept.tmp");
+		std::fs::write(&kept, b"x").unwrap();
+		TempFileGuard::new(&kept).disarm();
+		assert!(kept.exists());
+		{
+			let _guard = TempFileGuard::new(&kept);
+		}
+		assert!(!kept.exists());
+
+		std::fs::remove_dir_all(&dir).ok();
 	}
 
 	#[test]
