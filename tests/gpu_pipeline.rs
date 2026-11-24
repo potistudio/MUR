@@ -60,6 +60,34 @@ fn gpu_context(label: &str) -> Option<GpuContext> {
 	}
 }
 
+/// Asserts the per-frame throughput budget: 16.67 ms in release, a loose
+/// 100 ms sanity bound in debug.
+///
+/// Software adapters (WARP on GPU-less Windows CI runners, llvmpipe, …) still
+/// run every correctness check of the caller, but their timings say nothing
+/// about the production GPU, so the budget is reported and not enforced.
+fn assert_frame_budget(ctx: &GpuContext, what: &str, avg_ms: f64) {
+	let fps = 1000.0 / avg_ms;
+	let info = ctx.adapter.get_info();
+	if info.device_type == wgpu::DeviceType::Cpu {
+		eprintln!(
+			"[{what}] software adapter `{}`: skipping the frame-time budget ({avg_ms:.3} ms per frame, {fps:.1} fps)",
+			info.name
+		);
+		return;
+	}
+	let (budget_ms, kind) = if cfg!(debug_assertions) {
+		(100.0, "sanity budget")
+	} else {
+		(16.67, "60 fps budget")
+	};
+	let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+	assert!(
+		avg_ms < budget_ms,
+		"{profile} {what} exceeded the {kind}: {avg_ms:.3} ms per frame ({fps:.1} fps)"
+	);
+}
+
 /// Copies an arbitrary RGBA8 texture back to tightly packed pixels.
 fn read_texture_rgba8(ctx: &GpuContext, texture: &wgpu::Texture, width: u32, height: u32) -> Vec<u8> {
 	let unpadded_row = width * 4;
@@ -989,7 +1017,8 @@ fn prime_full_clip(streamer: &mur::media::LayerStreamer, clips: &[(ClipId, mur::
 /// `WaitUntil` event loop, so this proves per-frame GPU headroom below the
 /// 16.67 ms budget, not real-time 60 fps presentation. The real-time SPEC §11
 /// criterion is measured on the production machine from the app's `perf` log
-/// (see `docs/USAGE.md` §8).
+/// (see `docs/USAGE.md` §8). On software adapters only the correctness checks
+/// are enforced (see [`assert_frame_budget`]).
 #[test]
 fn four_layer_fhd_sustained_60fps_budget() {
 	let _guard = gpu_lock();
@@ -1194,16 +1223,7 @@ fn four_layer_fhd_sustained_60fps_budget() {
 		"the sustained loop reported streamer events"
 	);
 
-	#[cfg(not(debug_assertions))]
-	assert!(
-		avg_ms < 16.67,
-		"release build missed the 60 fps budget: {avg_ms:.3} ms per frame ({fps:.1} fps)"
-	);
-	#[cfg(debug_assertions)]
-	assert!(
-		avg_ms < 100.0,
-		"debug build exceeded the sanity budget: {avg_ms:.3} ms per frame ({fps:.1} fps)"
-	);
+	assert_frame_budget(&ctx, "build", avg_ms);
 }
 
 /// Streams 240 never-repeating frames per HAP layer through the real renderer.
@@ -1557,14 +1577,5 @@ fn soak_four_layer_sustained_with_midi() {
 		"a primed four-layer soak must serve every exact frame ({missed_frames} misses)"
 	);
 
-	#[cfg(not(debug_assertions))]
-	assert!(
-		avg_ms < 16.67,
-		"release soak missed the 60 fps budget: {avg_ms:.3} ms per frame ({fps:.1} fps)"
-	);
-	#[cfg(debug_assertions)]
-	assert!(
-		avg_ms < 100.0,
-		"debug soak exceeded the sanity budget: {avg_ms:.3} ms per frame ({fps:.1} fps)"
-	);
+	assert_frame_budget(&ctx, "soak", avg_ms);
 }
