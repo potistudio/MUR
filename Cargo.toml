@@ -17,3 +17,71 @@ opt-level = 3
 codegen-units = 1
 lto = true
 strip = true
+
+[dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
+crossbeam-channel = "0.5"
+directories = "6.0"
+egui = { version = "0.37.0", features = ["default_fonts"] }
+egui-wgpu = { version = "0.37.0", features = ["winit"] }
+egui-winit = "0.37.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+midir = "0.11"
+pollster = "1.0"
+raw-window-handle = "0.6"
+rfd = "0.18"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+snap = "1.1"
+thiserror = "2.0"
+toml = "1.2"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wgpu = "30.0"
+winit = { version = "0.30.13", features = ["rwh_06"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "NSApplication",
+  "NSEvent",
+  "NSGraphics",
+  "NSMenu",
+  "NSMenuItem",
+  "NSResponder",
+  "NSScreen",
+  "NSView",
+  "NSWindow",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "NSArray",
+  "NSDictionary",
+  "NSGeometry",
+  "NSObjCRuntime",
+  "NSObject",
+  "NSProcessInfo",
+  "NSString",
+  "NSThread",
+  "NSValue",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
