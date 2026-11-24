@@ -922,6 +922,13 @@ fn exit_guard_accepts_only_its_own_answers() {
 // Project files
 // ---------------------------------------------------------------------------
 
+/// A path that is absolute on the host. `/absolute/b.mov` is only
+/// root-relative on Windows, where joining it keeps the base dir's drive.
+#[cfg(windows)]
+const ABSOLUTE_CLIP: &str = "C:/absolute/b.mov";
+#[cfg(not(windows))]
+const ABSOLUTE_CLIP: &str = "/absolute/b.mov";
+
 #[test]
 fn toml_and_json_project_files_resolve_relative_media_paths() {
 	let dir = TempDir::new("project_files").unwrap();
@@ -929,9 +936,10 @@ fn toml_and_json_project_files_resolve_relative_media_paths() {
 	let toml_path = dir.path().join("show.toml");
 	std::fs::write(
 		&toml_path,
-		r#"
+		format!(
+			r#"
 clip_folder = "media"
-clips = ["clips/a.mov", "/absolute/b.mov"]
+clips = ["clips/a.mov", "{ABSOLUTE_CLIP}"]
 preferred_midi_port = "Launch Control XL 3"
 
 [output]
@@ -952,14 +960,15 @@ playback_mode = "OneShot"
 
 [[layers]]
 clip_path = "layers/two.mov"
-"#,
+"#
+		),
 	)
 	.unwrap();
 	let toml = ProjectConfig::load(&toml_path).unwrap();
 	assert_eq!(toml.clip_folder, Some(dir.path().join("media")));
 	assert_eq!(
 		toml.explicit_clips().unwrap(),
-		[dir.path().join("clips/a.mov"), PathBuf::from("/absolute/b.mov")]
+		[dir.path().join("clips/a.mov"), PathBuf::from(ABSOLUTE_CLIP)]
 	);
 	assert_eq!(toml.layers.len(), 2);
 	assert_eq!(toml.layers[0].clip_path, Some(dir.path().join("layers/one.mov")));
